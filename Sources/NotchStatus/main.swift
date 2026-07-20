@@ -22,9 +22,9 @@ private func visiblePacmanTrack(
     physicalNotchWidth: CGFloat
 ) -> ClosedRange<CGFloat> {
     let bodyRight = bounds.maxX - bodyInset
-    let end = bodyRight - 16
+    let end = bodyRight - 7
     let start = physicalNotchWidth > 0
-        ? bounds.midX + physicalNotchWidth / 2 + 10
+        ? bounds.midX + physicalNotchWidth / 2 + 7
         : bounds.minX + bodyInset + 58
     return min(start, end)...end
 }
@@ -641,14 +641,14 @@ private final class IslandView: NSView {
                 physicalNotchWidth: physicalNotchWidth
             )
             let pacmanX = track.lowerBound + (track.upperBound - track.lowerBound) * pacmanProgress
-            drawDots(after: pacmanX, from: track.lowerBound + 18, through: track.upperBound, y: centerY)
+            drawDots(after: pacmanX, from: track.lowerBound + 9, through: track.upperBound, y: centerY)
             drawPacman(at: NSPoint(x: pacmanX, y: centerY), pixel: 2, color: Palette.pacYellow, open: mouthOpen)
             setAccessibilityHelp("Codex is working")
         } else if let stopped = activities.first(where: { $0.phase == .stopped }) {
-            drawPacman(at: NSPoint(x: bodyRight - 16, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: false)
+            drawPacman(at: NSPoint(x: bodyRight - 7, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: false)
             setAccessibilityHelp("\(stopped.title) stopped")
         } else if let ready = activities.first(where: { $0.phase == .ready }) {
-            drawPacman(at: NSPoint(x: bodyRight - 16, y: centerY), pixel: 2, color: Palette.readyGreen, open: false)
+            drawPacman(at: NSPoint(x: bodyRight - 19, y: centerY), pixel: 2, color: Palette.readyGreen, open: false)
             setAccessibilityHelp("\(ready.title) is complete")
         } else {
             Palette.ghostPurple.setFill()
@@ -672,7 +672,7 @@ private final class IslandView: NSView {
 
         for (index, activity) in activities.prefix(5).enumerated() {
             let rowTop = bounds.maxY - topBandHeight - CGFloat(index * 46)
-            let centerY = rowTop - 24
+            let centerY = rowTop - 16
             let color = statusColor(for: activity.phase)
             let project = String(activity.project.prefix(18))
             let projectFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
@@ -695,7 +695,7 @@ private final class IslandView: NSView {
             drawSourceMarker(activity.source, in: NSRect(x: sourceMarkerX, y: rowTop - 19, width: 11, height: 11))
             drawText(
                 project,
-                in: NSRect(x: projectX, y: rowTop - 22, width: projectWidth, height: 16),
+                in: NSRect(x: projectX, y: rowTop - 23, width: projectWidth, height: 16),
                 font: projectFont,
                 color: Palette.tertiaryInk
             )
@@ -708,7 +708,7 @@ private final class IslandView: NSView {
         }
     }
 
-    private var bodyInset: CGFloat { expanded ? 30 : 24 }
+    private var bodyInset: CGFloat { expanded ? 30 : 12 }
 
     private func islandPath() -> NSBezierPath {
         let neckHeight: CGFloat = expanded ? 10 : 8
@@ -756,10 +756,10 @@ private final class IslandView: NSView {
         Palette.tertiaryInk.setFill()
         var x = startX
         while x <= endX {
-            if x > pacmanX + 9 {
+            if x > pacmanX + 7 {
                 NSRect(x: x - 1, y: y - 1, width: 2, height: 2).fill()
             }
-            x += 18
+            x += 9
         }
     }
 
@@ -897,7 +897,7 @@ private final class IslandController {
             physicalNotchWidth = 0
         }
 
-        let collapsedWidth = physicalNotchWidth > 0 ? physicalNotchWidth + 144 : 252
+        let collapsedWidth = physicalNotchWidth > 0 ? (physicalNotchWidth + 180) * 0.75 : 189
         island.setTopBandHeight(collapsedHeight)
         island.setPhysicalNotchWidth(physicalNotchWidth)
         let rowCount = max(1, min(activities.count, 5))
