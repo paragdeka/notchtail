@@ -663,7 +663,7 @@ private final class IslandView: NSView {
             NSRect(x: bodyRight - 10, y: centerY - 7, width: 10, height: 14).fill()
             setAccessibilityHelp("Codex is working")
         } else if let stopped = activities.first(where: { $0.phase == .stopped }) {
-            drawPacman(at: NSPoint(x: bodyRight - 7, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: false)
+            drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: true)
             setAccessibilityHelp("\(stopped.title) stopped")
         } else if let ready = activities.first(where: { $0.phase == .ready }) {
             drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.readyGreen, open: true)
