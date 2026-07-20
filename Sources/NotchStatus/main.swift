@@ -648,7 +648,7 @@ private final class IslandView: NSView {
             drawPacman(at: NSPoint(x: bodyRight - 7, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: false)
             setAccessibilityHelp("\(stopped.title) stopped")
         } else if let ready = activities.first(where: { $0.phase == .ready }) {
-            drawPacman(at: NSPoint(x: bodyRight - 19, y: centerY), pixel: 2, color: Palette.readyGreen, open: false)
+            drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.readyGreen, open: false)
             setAccessibilityHelp("\(ready.title) is complete")
         } else {
             Palette.ghostPurple.setFill()
