@@ -674,7 +674,9 @@ private final class IslandView: NSView {
             let rowTop = bounds.maxY - topBandHeight - CGFloat(index * 46)
             let centerY = rowTop - 24
             let color = statusColor(for: activity.phase)
-            let projectWidth: CGFloat = 126
+            let project = String(activity.project.prefix(18))
+            let projectFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+            let projectWidth = ceil((project as NSString).size(withAttributes: [.font: projectFont]).width)
             let projectX = bodyRight - 16 - projectWidth
             let sourceMarkerX = projectX - 15
             let textX = bodyLeft + 35
@@ -692,11 +694,10 @@ private final class IslandView: NSView {
             )
             drawSourceMarker(activity.source, in: NSRect(x: sourceMarkerX, y: rowTop - 19, width: 11, height: 11))
             drawText(
-                activity.project,
+                project,
                 in: NSRect(x: projectX, y: rowTop - 22, width: projectWidth, height: 16),
-                font: .monospacedSystemFont(ofSize: 9, weight: .medium),
-                color: Palette.tertiaryInk,
-                alignment: .right
+                font: projectFont,
+                color: Palette.tertiaryInk
             )
             drawText(
                 activity.detail,
