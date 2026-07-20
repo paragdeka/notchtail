@@ -947,8 +947,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         monitor.onCompletion = { activity in
             let content = UNMutableNotificationContent()
             content.title = "Codex task complete"
+            let marker = ["extension": "🟦", "cli": "🟩", "codex": "🟪"][activity.source] ?? "⬜"
+            content.subtitle = "\(marker) \(activity.project.prefix(18))"
             content.body = activity.title
-            content.sound = .default
+            NSSound(named: "Blow")?.play()
             notifications.add(
                 UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil),
                 withCompletionHandler: { error in
