@@ -24,8 +24,8 @@ private func visiblePacmanTrack(
     let bodyRight = bounds.maxX - bodyInset
     let end = bodyRight - 7
     let start = physicalNotchWidth > 0
-        ? bounds.midX + physicalNotchWidth / 2 + 7
-        : bounds.minX + bodyInset + 58
+        ? bounds.midX + physicalNotchWidth / 2 - 7
+        : bounds.minX + bodyInset + 44
     return min(start, end)...end
 }
 
@@ -616,10 +616,26 @@ private final class IslandView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSGraphicsContext.current?.cgContext.clear(bounds)
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.clear(bounds)
         Palette.notchBlack.setFill()
-        islandPath().fill()
-        if expanded { drawExpanded() } else { drawCollapsed() }
+        let path = islandPath()
+        path.fill()
+        path.addClip()
+
+        let progress = expansionProgress
+        if progress < 1 {
+            context.saveGState()
+            context.setAlpha(1 - progress)
+            drawCollapsed()
+            context.restoreGState()
+        }
+        if progress > 0 {
+            context.saveGState()
+            context.setAlpha(progress)
+            drawExpanded()
+            context.restoreGState()
+        }
     }
 
     private func drawCollapsed() {
@@ -643,12 +659,14 @@ private final class IslandView: NSView {
             let pacmanX = track.lowerBound + (track.upperBound - track.lowerBound) * pacmanProgress
             drawDots(after: pacmanX, from: track.lowerBound + 9, through: track.upperBound, y: centerY)
             drawPacman(at: NSPoint(x: pacmanX, y: centerY), pixel: 2, color: Palette.pacYellow, open: mouthOpen)
+            Palette.notchBlack.setFill()
+            NSRect(x: bodyRight - 10, y: centerY - 7, width: 10, height: 14).fill()
             setAccessibilityHelp("Codex is working")
         } else if let stopped = activities.first(where: { $0.phase == .stopped }) {
             drawPacman(at: NSPoint(x: bodyRight - 7, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: false)
             setAccessibilityHelp("\(stopped.title) stopped")
         } else if let ready = activities.first(where: { $0.phase == .ready }) {
-            drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.readyGreen, open: false)
+            drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.readyGreen, open: true)
             setAccessibilityHelp("\(ready.title) is complete")
         } else {
             Palette.ghostPurple.setFill()
@@ -684,7 +702,7 @@ private final class IslandView: NSView {
                 at: NSPoint(x: bodyLeft + 16, y: centerY),
                 pixel: 2,
                 color: color,
-                open: activity.phase == .running && mouthOpen
+                open: activity.phase == .ready || (activity.phase == .running && mouthOpen)
             )
             drawText(
                 activity.title,
@@ -708,12 +726,17 @@ private final class IslandView: NSView {
         }
     }
 
-    private var bodyInset: CGFloat { expanded ? 30 : 12 }
+    private var expansionProgress: CGFloat {
+        let expandedBodyHeight = CGFloat(max(1, min(activities.count, 5)) * 46) + 10
+        return min(1, max(0, (bounds.height - topBandHeight) / expandedBodyHeight))
+    }
+
+    private var bodyInset: CGFloat { 12 + 18 * expansionProgress }
 
     private func islandPath() -> NSBezierPath {
-        let neckHeight: CGFloat = expanded ? 10 : 8
+        let neckHeight = 8 + 2 * expansionProgress
         let neckInset = neckHeight * 0.55
-        let bottomRadius: CGFloat = expanded ? 22 : 13
+        let bottomRadius = 13 + 9 * expansionProgress
         let k: CGFloat = 0.552_284_8
         let topY = bounds.maxY
         let neckY = topY - neckHeight
@@ -821,7 +844,7 @@ private final class IslandView: NSView {
             let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 mouthOpen.toggle()
-                pacmanProgress += 0.02
+                pacmanProgress += 0.04
                 if pacmanProgress >= 1 { pacmanProgress = 0 }
                 needsDisplay = true
             }
@@ -996,7 +1019,7 @@ private func runSelfTest() {
         bodyInset: 24,
         physicalNotchWidth: 180
     )
-    assert(track.lowerBound > 270 && track.upperBound <= 332)
+    assert(track.lowerBound == 263 && track.upperBound == 329)
 
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-\(UUID().uuidString)")
     let formatter = DateFormatter()
