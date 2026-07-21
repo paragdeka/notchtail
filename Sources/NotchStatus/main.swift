@@ -657,10 +657,16 @@ private final class IslandView: NSView {
                 physicalNotchWidth: physicalNotchWidth
             )
             let pacmanX = track.lowerBound + (track.upperBound - track.lowerBound) * pacmanProgress
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: NSRect(
+                x: bounds.minX,
+                y: bounds.minY,
+                width: bodyRight - 10 - bounds.minX,
+                height: bounds.height
+            )).addClip()
             drawDots(after: pacmanX, from: track.lowerBound + 9, through: track.upperBound, y: centerY)
             drawPacman(at: NSPoint(x: pacmanX, y: centerY), pixel: 2, color: Palette.pacYellow, open: mouthOpen)
-            Palette.notchBlack.setFill()
-            NSRect(x: bodyRight - 10, y: centerY - 7, width: 10, height: 14).fill()
+            NSGraphicsContext.restoreGraphicsState()
             setAccessibilityHelp("Codex is working")
         } else if let stopped = activities.first(where: { $0.phase == .stopped }) {
             drawPacman(at: NSPoint(x: bodyRight - 20, y: centerY), pixel: 2, color: Palette.stoppedOrange, open: true)
