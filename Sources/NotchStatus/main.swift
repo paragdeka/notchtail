@@ -306,6 +306,7 @@ private let taskNeedle = Data("\"payload\":{\"type\":\"task_".utf8)
 private let abortedNeedle = Data("\"payload\":{\"type\":\"turn_aborted\"".utf8)
 private let responseNeedle = Data("\"payload\":{\"type\":\"agent_message\"".utf8)
 private let promptNeedle = Data("\"payload\":{\"type\":\"user_message\"".utf8)
+private let messageRoleNeedle = Data("\"role\"".utf8)
 private let usageNeedle = Data("\"payload\":{\"type\":\"token_count\"".utf8)
 private let contextNeedle = Data("\"type\":\"turn_context\"".utf8)
 
@@ -324,23 +325,41 @@ private func parseTurnEvent(_ line: Data) -> TurnEvent? {
     }
 }
 
-private func parseMessage(_ line: Data, needle: Data, type: String) -> String? {
-    guard line.range(of: needle) != nil,
+private func parseMessage(_ line: Data, needle: Data, type: String, role: String) -> String? {
+    guard line.range(of: needle) != nil || line.range(of: messageRoleNeedle) != nil,
           let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-          object["type"] as? String == "event_msg",
-          let payload = object["payload"] as? [String: Any],
-          payload["type"] as? String == type,
-          let message = payload["message"] as? String else { return nil }
+          let payload = object["payload"] as? [String: Any] else { return nil }
 
-    return condensedText(message)
+    if object["type"] as? String == "event_msg", payload["type"] as? String == type,
+       let message = payload["message"] as? String {
+        return condensedText(message)
+    }
+    guard object["type"] as? String == "response_item",
+          payload["type"] as? String == "message", payload["role"] as? String == role,
+          let content = payload["content"] as? [[String: Any]] else { return nil }
+    let metadata = payload["internal_chat_message_metadata_passthrough"] as? [String: Any]
+    let kinds = metadata?["content_item_kinds"] as? [String]
+    let texts = content.enumerated().compactMap { index, block -> String? in
+        guard block["type"] as? String == (role == "user" ? "input_text" : "output_text"),
+              let text = block["text"] as? String else { return nil }
+        if role == "user" {
+            if let kinds {
+                guard kinds.indices.contains(index), kinds[index] == "user.text" else { return nil }
+            } else if text.hasPrefix("# AGENTS.md instructions") || text.hasPrefix("<environment_context>") {
+                return nil
+            }
+        }
+        return text
+    }
+    return condensedText(texts.joined(separator: "\n"))
 }
 
 private func parseResponse(_ line: Data) -> String? {
-    parseMessage(line, needle: responseNeedle, type: "agent_message")
+    parseMessage(line, needle: responseNeedle, type: "agent_message", role: "assistant")
 }
 
 private func parsePrompt(_ line: Data) -> String? {
-    parseMessage(line, needle: promptNeedle, type: "user_message")
+    parseMessage(line, needle: promptNeedle, type: "user_message", role: "user")
 }
 
 private func parseModel(_ line: Data) -> String? {
@@ -487,10 +506,12 @@ private struct ClaudeSessionState {
     var prompt: String?
     var response: String?
     var model: String?
-    var name: String?
+    var name: String? { customName ?? generatedName }
     var source: String?
     var updatedAt: Date?
     var pending: [String: AgentPrompt] = [:]
+    private var customName: String?
+    private var generatedName: String?
     private var messageTokens: [String: Int] = [:]
     private var totalTokens = 0
     private var contextTokens = 0
@@ -533,7 +554,10 @@ private struct ClaudeSessionState {
                       object["isCompactSummary"] as? Bool != true,
                       text?.hasPrefix("<local-command-") != true,
                       text?.hasPrefix("<command-name>") != true else { return false }
-                prompt = text
+                let taskNotification = text?.hasPrefix("<task-notification>") == true
+                    || (object["origin"] as? [String: Any])?["kind"] as? String == "task-notification"
+                    || object["turnOrigin"] as? String == "task_notification"
+                if !taskNotification, let text { prompt = text }
                 response = nil
                 pending.removeAll()
                 event = .started
@@ -583,7 +607,11 @@ private struct ClaudeSessionState {
             guard event == .started else { return false }
         case "custom-title":
             guard let value = object["customTitle"] as? String else { return false }
-            name = condensedText(value)
+            customName = condensedText(value)
+            turnActivity = false
+        case "ai-title":
+            guard let value = object["aiTitle"] as? String, let title = condensedText(value) else { return false }
+            generatedName = title
             turnActivity = false
         case "cost-state":
             guard let value = (object["totalCostUSD"] as? NSNumber)?.doubleValue,
@@ -1146,9 +1174,10 @@ private final class SessionMonitor {
     }
 
     private func recentSessionPaths() -> [String] {
-        var paths: [String] = codexSessionPaths() + piSessionPaths() + claudeSessionPaths()
-        paths.removeAll { cursors[$0] != nil }
-        return paths
+        // Discovery and FSEvents must use the same key for filesystem aliases.
+        let paths = (codexSessionPaths() + piSessionPaths() + claudeSessionPaths())
+            .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        return Array(Set(paths)).filter { cursors[$0] == nil }
     }
 
     private func codexSessionPaths() -> [String] {
@@ -1177,45 +1206,42 @@ private final class SessionMonitor {
         return Array(Set(paths))
     }
 
-    private func codexIndexedThreadPaths() -> [String] {
+    private var codexStateDatabaseURL: URL? {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: codexHome,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
-        ), let index = files
+        ) else { return nil }
+        return files
             .compactMap({ file -> (Int, URL)? in
                 guard file.lastPathComponent.hasPrefix("state_"), file.pathExtension == "sqlite" else { return nil }
                 let digits = file.deletingPathExtension().lastPathComponent.dropFirst("state_".count)
                 guard let version = Int(digits) else { return nil }
                 return (version, file)
             })
-            .max(by: { $0.0 < $1.0 })?.1 else { return [] }
+            .max(by: { $0.0 < $1.0 })?.1
+    }
 
-        var database: OpaquePointer?
-        guard sqlite3_open_v2(index.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
-              let database else {
-            if let database { sqlite3_close(database) }
-            return []
-        }
-        defer { sqlite3_close(database) }
-        sqlite3_busy_timeout(database, 300)
+    private func codexIndexedThreadPaths() -> [String] {
+        guard let index = codexStateDatabaseURL else { return [] }
+        return withReadOnlyDatabase(index) { database in
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            // Two-day cutoff mirrors the date-directory scan above.
+            guard sqlite3_prepare_v2(
+                database,
+                "SELECT rollout_path FROM threads WHERE archived = 0 AND updated_at > ?",
+                -1, &statement, nil
+            ) == SQLITE_OK else { return [] }
+            sqlite3_bind_int64(statement, 1, Int64(Date().timeIntervalSince1970 - 2 * 86_400))
 
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        // Two-day cutoff mirrors the date-directory scan above.
-        guard sqlite3_prepare_v2(
-            database,
-            "SELECT rollout_path FROM threads WHERE archived = 0 AND updated_at > ?",
-            -1, &statement, nil
-        ) == SQLITE_OK else { return [] }
-        sqlite3_bind_int64(statement, 1, Int64(Date().timeIntervalSince1970 - 2 * 86_400))
-
-        var paths: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW,
-              let text = sqlite3_column_text(statement, 0) {
-            paths.append(String(cString: text))
-        }
-        return paths
+            var paths: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let text = sqlite3_column_text(statement, 0) {
+                paths.append(String(cString: text))
+            }
+            return paths
+        } ?? []
     }
 
     private func piSessionPaths() -> [String] {
@@ -1293,6 +1319,18 @@ private final class SessionMonitor {
 
     private func reconcile() {
         var changed = false
+        let refreshedTitles = loadTitles()
+        if refreshedTitles != titles {
+            titles = refreshedTitles
+            for cursor in cursors.values where cursor.meta.agent == .codex {
+                guard let previous = activities[cursor.meta.key] else { continue }
+                let updated = activity(for: cursor.meta, phase: previous.phase, at: previous.updatedAt)
+                if previous != updated {
+                    activities[cursor.meta.key] = updated
+                    changed = true
+                }
+            }
+        }
         for path in Set(recentSessionPaths()).union(cursors.keys) {
             changed = (cursors[path] == nil ? register(path) : readAppendedEvents(from: path)) || changed
         }
@@ -1362,7 +1400,7 @@ private struct OpencodeSessionRow {
         tailOpencodeLog()
         return opencodeStores.reduce(false) { changed, store in
             guard FileManager.default.fileExists(atPath: store.databaseURL.path) else { return changed }
-            return (withOpencodeDatabase(store) { database in
+            return (withReadOnlyDatabase(store.databaseURL) { database in
                 let legacyChanged = readOpencodeSessions(database, agent: .opencode, table: "session", schema: .v1)
                 let v2Changed = readOpencodeSessions(database, agent: .opencode2, table: "session_v2", schema: .v2)
                 let promptChanged = refreshOpencodePrompts(database)
@@ -1400,9 +1438,9 @@ private struct OpencodeSessionRow {
         }
     }
 
-    private func withOpencodeDatabase<T>(_ store: OpencodeStore, _ body: (OpaquePointer) -> T?) -> T? {
+    private func withReadOnlyDatabase<T>(_ url: URL, _ body: (OpaquePointer) -> T?) -> T? {
         var database: OpaquePointer?
-        let result = sqlite3_open_v2(store.databaseURL.path, &database, SQLITE_OPEN_READONLY, nil)
+        let result = sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil)
         guard result == SQLITE_OK else {
             if let database { sqlite3_close(database) }
             return nil
@@ -1783,7 +1821,8 @@ private struct OpencodeSessionRow {
     private func consume(_ paths: [String]) {
         var changed = false
         let visibleIDs = Set(activities.keys)
-        let pathsToRefresh = Set(paths.filter { $0.hasSuffix(".jsonl") }).union(
+        let pathsToRefresh = Set(paths.filter { $0.hasSuffix(".jsonl") }
+            .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }).union(
             cursors.compactMap { visibleIDs.contains($0.value.meta.key) ? $0.key : nil }
         )
 
@@ -2401,17 +2440,37 @@ private struct OpencodeSessionRow {
 
     private func loadTitles() -> [String: String] {
         let index = codexHome.appendingPathComponent("session_index.jsonl")
-        guard let data = try? Data(contentsOf: index) else { return [:] }
-
         var result: [String: String] = [:]
-        for line in data.split(separator: 0x0A) {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let id = object["id"] as? String,
-                  let title = object["thread_name"] as? String,
-                  !title.isEmpty else { continue }
-            result[id] = title
+        if let data = try? Data(contentsOf: index) {
+            for line in data.split(separator: 0x0A) {
+                guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                      let id = object["id"] as? String,
+                      let title = object["thread_name"] as? String,
+                      let name = condensedText(title) else { continue }
+                result[id] = name
+            }
         }
-        return result
+        guard let databaseURL = codexStateDatabaseURL else { return result }
+        return withReadOnlyDatabase(databaseURL) { database in
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let filter = "FROM threads WHERE archived = 0 AND updated_at > ?"
+            if sqlite3_prepare_v2(database, "SELECT id, name, title \(filter)", -1, &statement, nil) != SQLITE_OK {
+                sqlite3_finalize(statement)
+                statement = nil
+                // Older Codex databases have a title but no separate manual name.
+                guard sqlite3_prepare_v2(database, "SELECT id, NULL, title \(filter)", -1, &statement, nil) == SQLITE_OK else { return result }
+            }
+            sqlite3_bind_int64(statement, 1, Int64(Date().timeIntervalSince1970 - 2 * 86_400))
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let text = sqlite3_column_text(statement, 0) else { continue }
+                let id = String(cString: text)
+                let name = sqlite3_column_text(statement, 1).flatMap { condensedText(String(cString: $0)) }
+                let title = sqlite3_column_text(statement, 2).flatMap { condensedText(String(cString: $0)) }
+                result[id] = name ?? result[id] ?? title
+            }
+            return result
+        } ?? result
     }
 
     private func loadPiContextWindows() -> [String: Int] {
@@ -2433,16 +2492,19 @@ private struct OpencodeSessionRow {
     }
 
     private func activity(for meta: SessionMeta, phase: ThreadPhase, at date: Date) -> ThreadActivity {
-        ThreadActivity(
+        let title: String?
+        switch meta.agent {
+        case .codex: title = titles[meta.id] ?? prompts[meta.key]
+        case .claude: title = claudeSessions[meta.key]?.name ?? prompts[meta.key]
+        case .pi: title = prompts[meta.key] ?? piSessionNames[meta.key]
+        case .opencode, .opencode2: title = opencodeTitles[meta.key] ?? prompts[meta.key]
+        }
+        return ThreadActivity(
             id: meta.id,
             agent: meta.agent,
             parentID: meta.parentID,
             nickname: meta.nickname,
-            title: (meta.agent == .opencode || meta.agent == .opencode2
-                ? opencodeTitles[meta.key] ?? prompts[meta.key]
-                : (meta.agent == .claude ? claudeSessions[meta.key]?.name : nil) ?? prompts[meta.key]
-                    ?? (meta.agent == .pi ? piSessionNames[meta.key] : titles[meta.key]))
-                ?? (meta.project.isEmpty ? "\(meta.agent.displayName) thread" : meta.project),
+            title: title ?? (meta.project.isEmpty ? "\(meta.agent.displayName) thread" : meta.project),
             detail: responses[meta.key] ?? "",
             source: meta.source,
             project: meta.project,
@@ -3682,6 +3744,15 @@ private func runSelfTest() {
     assert(parseTurnEvent(unrelated) == nil)
     assert(parseResponse(response) == "Done. Ready now.")
     assert(parsePrompt(prompt) == "whats this codebase about?")
+    let currentCodexPrompt = Data(##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\nIgnore this context as a title."},{"type":"input_text","text":"Restore the thread names"}]}}"##.utf8)
+    let currentCodexResponse = Data(#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Names restored."}]}}"#.utf8)
+    assert(parsePrompt(currentCodexPrompt) == "Restore the thread names", "Current Codex user messages must supply the session label")
+    assert(parseResponse(currentCodexResponse) == "Names restored.")
+    let codexContextOnly = Data(##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\nContext"},{"type":"input_text","text":"<environment_context>Context</environment_context>"}]}}"##.utf8)
+    assert(parsePrompt(codexContextOnly) == nil, "Injected context must not become a session label")
+    let codexTypedContent = Data(#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Injected context"},{"type":"input_text","text":"Actual request"},{"type":"input_image","image_url":"unused"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["agents_md.instructions","user.text","user.image"]}}}"#.utf8)
+    assert(parsePrompt(codexTypedContent) == "Actual request")
+    assert(parsePrompt(currentCodexResponse) == nil && parseResponse(currentCodexPrompt) == nil)
     assert(parseModel(context) == "gpt-5.6-sol/high")
     assert(parseUsage(usage)?.contextTokens == 50_000)
     assert(agentRowLabel(.opencode) == "oc")
@@ -3929,7 +4000,9 @@ private func runSelfTest() {
     let meta = #"{"type":"session_meta","payload":{"id":"self-test","source":"vscode","originator":"codex_vscode","cwd":"/tmp/workspace"}}"#
     let childMeta = #"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"self-test","source":{"subagent":{"thread_spawn":{"agent_nickname":"guardian","parent_thread_id":"self-test"}}},"thread_source":"cli","originator":"codex_cli_rs","cwd":"/tmp/workspace"}}"#
     try! Data("\(meta)\n\(String(decoding: started, as: UTF8.self))\n\(String(decoding: prompt, as: UTF8.self))\n\(String(decoding: context, as: UTF8.self))\n\(String(decoding: usage, as: UTF8.self))\n".utf8).write(to: session)
-    try! Data("\(childMeta)\n\(String(decoding: started, as: UTF8.self))\n\(String(decoding: prompt, as: UTF8.self))\n".utf8).write(to: childSession)
+    try! Data("\(childMeta)\n\(String(decoding: started, as: UTF8.self))\n\(String(decoding: currentCodexPrompt, as: UTF8.self))\n".utf8).write(to: childSession)
+    try! Data(#"{"id":"self-test","thread_name":"Saved Codex name"}"#.utf8)
+        .write(to: root.appendingPathComponent("session_index.jsonl"))
     setenv("CODEX_HOME", root.path, 1)
     // isolate opencode from the machine's real ~/.local/share/opencode during monitor tests
     let emptyDataHome = FileManager.default.temporaryDirectory
@@ -3952,7 +4025,8 @@ private func runSelfTest() {
     })
     let parent = latest.first { $0.id == "self-test" }
     let child = latest.first { $0.id == "child" }
-    assert(parent?.title == "whats this codebase about?")
+    assert(parent?.title == "Saved Codex name", "Codex names must be found by thread ID and shown before prompt fallbacks")
+    assert(child?.title == "Restore the thread names")
     assert(parent?.model == "gpt-5.6-sol/high")
     assert(parent?.usage?.totalTokens == 120_000)
     assert(child?.parentID == "self-test" && child?.nickname == "guardian")
@@ -3969,12 +4043,14 @@ private func runSelfTest() {
     assert(groupActivities(latest).first { $0.root.id == "self-test" }?.phase == .ready)
     let childHandle = try! FileHandle(forWritingTo: childSession)
     try! childHandle.seekToEnd()
-    try! childHandle.write(contentsOf: completed + Data("\n".utf8))
+    try! childHandle.write(contentsOf: currentCodexResponse + Data("\n".utf8) + completed + Data("\n".utf8))
     try! childHandle.close()
     assert(waitUntil(timeout: 3) { latest.first(where: { $0.id == "child" })?.phase == .ready })
+    assert(latest.first(where: { $0.id == "child" })?.detail == "Names restored.")
     assert(completions.count == 1)
     monitor.acknowledge(codexSources: ["extension"], piSources: [], opencodeSources: [])
     assert(waitUntil { latest.first(where: { $0.id == "self-test" })?.phase == .seen })
+    let phaseBeforeTitleUpdates = latest.first { $0.id == "self-test" }?.phase
 
     // The VS Code extension resumes threads whose rollouts live in old date
     // directories; the state_N.sqlite threads index must surface them.
@@ -3986,12 +4062,30 @@ private func runSelfTest() {
     var indexDB: OpaquePointer?
     assert(sqlite3_open_v2(root.appendingPathComponent("state_1.sqlite").path, &indexDB, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
     guard let indexDB else { fatalError("sqlite open failed") }
-    assert(sqlite3_exec(indexDB, "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL)", nil, nil, nil) == SQLITE_OK)
-    assert(sqlite3_exec(indexDB, "INSERT INTO threads VALUES ('self-test-old', '\(oldSession.path)', \(Int(Date().timeIntervalSince1970)), 0)", nil, nil, nil) == SQLITE_OK)
-    sqlite3_close(indexDB)
+    assert(sqlite3_exec(indexDB, "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL, title TEXT)", nil, nil, nil) == SQLITE_OK)
+    assert(sqlite3_exec(indexDB, "INSERT INTO threads VALUES ('self-test-old', '\(oldSession.path)', \(Int(Date().timeIntervalSince1970)), 0, 'Database generated title')", nil, nil, nil) == SQLITE_OK)
     assert(waitUntil(timeout: 3) {
         latest.contains { $0.id == "self-test-old" && $0.phase == .running && $0.source == "extension" }
     })
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "self-test-old" }?.title == "Database generated title" },
+           "Codex titles stored in the state database must precede prompt fallbacks")
+    let titleDate = latest.first { $0.id == "self-test-old" }?.updatedAt
+    assert(sqlite3_exec(indexDB, "ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET name = 'Database manual name' WHERE id = 'self-test-old'", nil, nil, nil) == SQLITE_OK)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "self-test-old" }?.title == "Database manual name" },
+           "Saved Codex names must refresh without another turn event")
+    assert(latest.first { $0.id == "self-test-old" }?.updatedAt == titleDate)
+    assert(sqlite3_exec(indexDB, "INSERT INTO threads VALUES ('self-test', '\(session.path)', \(Int(Date().timeIntervalSince1970)), 0, 'Database automatic title', 'Current database name')", nil, nil, nil) == SQLITE_OK)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "self-test" }?.title == "Current database name" },
+           "The current database name must override a stale session-index name")
+    assert(latest.first { $0.id == "self-test" }?.phase == phaseBeforeTitleUpdates,
+           "Title refresh changed phase from \(String(describing: phaseBeforeTitleUpdates)) to \(String(describing: latest.first { $0.id == "self-test" }?.phase))")
+    assert(sqlite3_exec(indexDB, "UPDATE threads SET name = '  ' WHERE id = 'self-test-old'", nil, nil, nil) == SQLITE_OK)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "self-test-old" }?.title == "Database generated title" })
+    try! FileManager.default.removeItem(at: root.appendingPathComponent("session_index.jsonl"))
+    assert(sqlite3_exec(indexDB, "UPDATE threads SET name = 'Database-only saved name' WHERE id = 'self-test-old'", nil, nil, nil) == SQLITE_OK)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "self-test-old" }?.title == "Database-only saved name" },
+           "Codex database names must work when session_index.jsonl is missing")
+    sqlite3_close(indexDB)
 
     let shellSnapshots = root.appendingPathComponent("shell_snapshots")
     try! FileManager.default.createDirectory(at: shellSnapshots, withIntermediateDirectories: true)
@@ -4396,6 +4490,33 @@ private func runClaudeSelfTest() {
         "content": [["type": "tool_use", "id": "plan-1", "name": "ExitPlanMode", "input": ["plan": "Build it."]]]]])
     let interrupted = record(["type": "user", "message": ["role": "user", "content": "[Request interrupted by user]"]])
     let cost = record(["type": "cost-state", "totalCostUSD": 0.04])
+    let generatedTitle = record(["type": "ai-title", "aiTitle": "Generated session title"])
+    let taskNotification = record(["type": "user", "origin": ["kind": "task-notification"],
+        "turnOrigin": "task_notification", "message": ["content": "<task-notification><task-id>background-task</task-id></task-notification>"]])
+
+    var titleState = ClaudeSessionState()
+    titleState.consume(user)
+    let promptDate = titleState.updatedAt
+    assert(titleState.consume(generatedTitle) && titleState.name == "Generated session title",
+           "Claude's saved generated title must take precedence over the prompt fallback")
+    assert(titleState.event == .started && titleState.updatedAt == promptDate)
+    assert(!titleState.consume(record(["type": "ai-title", "aiTitle": "  "])) && titleState.name == "Generated session title")
+    titleState.consume(record(["type": "custom-title", "customTitle": "Manually renamed session"]))
+    titleState.consume(record(["type": "ai-title", "aiTitle": "Later generated title"]))
+    assert(titleState.name == "Manually renamed session", "Generated titles must not overwrite manual names")
+
+    var notificationState = ClaudeSessionState()
+    notificationState.consume(user)
+    notificationState.consume(done)
+    notificationState.consume(taskNotification)
+    assert(notificationState.prompt == "hello from Claude" && notificationState.event == .started,
+           "Task notifications start background turns without replacing the actual prompt fallback")
+    notificationState.consume(record(["type": "user", "message": ["content": [
+        ["type": "text", "text": "<task-notification>Task finished</task-notification>"]]]]))
+    assert(notificationState.prompt == "hello from Claude")
+    notificationState.consume(record(["type": "user", "origin": ["kind": "task-notification"],
+        "message": ["content": "Background task finished"]]))
+    assert(notificationState.prompt == "hello from Claude")
 
     var state = ClaudeSessionState()
     assert(!state.consume(Data("broken json".utf8)))
@@ -4446,7 +4567,7 @@ private func runClaudeSelfTest() {
     let childFile = children.appendingPathComponent("agent-child.jsonl")
     let split = tool.count / 2
     let header = Data(#"{"type":"mode","mode":"normal","sessionId":"claude-test"}"#.utf8) + Data([0x0A])
-    try! (header + user + tool.prefix(split)).write(to: cliFile)
+    try! (header + generatedTitle + user + tool.prefix(split)).write(to: cliFile)
     let desktopUser = record(["type": "user", "message": ["role": "user", "content": "Desktop task"]], sessionID: "desktop-test", entrypoint: "claude-desktop")
     let desktopDone = record(["type": "assistant", "message": ["stop_reason": "end_turn", "content": "Desktop done."]], sessionID: "desktop-test", entrypoint: "claude-desktop")
     try! (desktopUser + desktopDone).write(to: desktopFile)
@@ -4472,6 +4593,7 @@ private func runClaudeSelfTest() {
     assert(completions.isEmpty && askings.isEmpty)
     assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.count == 1)
     assert(latest.first { $0.id == "claude-test" }?.project == "workspace")
+    assert(latest.first { $0.id == "claude-test" }?.title == "Generated session title")
 
     func append(_ data: Data, to file: URL = cliFile) {
         let handle = try! FileHandle(forWritingTo: file)
@@ -4500,6 +4622,9 @@ private func runClaudeSelfTest() {
     monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
     assert(waitUntil { latest.first { $0.id == "claude-test" }?.phase == .seen })
     assert(latest.first { $0.id == "desktop-test" }?.phase == .ready)
+    append(record(["type": "ai-title", "aiTitle": "Updated generated title"]))
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.title == "Updated generated title" })
+    assert(latest.first { $0.id == "claude-test" }?.phase == .seen)
     append(record(["type": "custom-title", "customTitle": "Named session"]) + cost)
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.title == "Named session" })
     assert(latest.first { $0.id == "claude-test" }?.phase == .seen)
