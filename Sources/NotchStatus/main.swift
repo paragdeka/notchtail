@@ -556,12 +556,11 @@ private struct ClaudeSessionState {
     private var messageTokens: [String: Int] = [:]
     private var totalTokens = 0
     private var contextTokens = 0
-    private var cost: Double?
 
     var usage: UsageSnapshot? {
-        guard !messageTokens.isEmpty || cost != nil else { return nil }
+        guard !messageTokens.isEmpty else { return nil }
         return UsageSnapshot(totalTokens: totalTokens, contextTokens: contextTokens, contextWindow: 0,
-                             primaryLimit: nil, secondaryLimit: nil, costTotal: cost)
+                             primaryLimit: nil, secondaryLimit: nil, costTotal: nil)
     }
 
     @discardableResult
@@ -675,11 +674,6 @@ private struct ClaudeSessionState {
         case "ai-title":
             guard let value = object["aiTitle"] as? String, let title = condensedText(value) else { return false }
             generatedName = title
-            turnActivity = false
-        case "cost-state":
-            guard let value = (object["totalCostUSD"] as? NSNumber)?.doubleValue,
-                  value.isFinite, value >= 0 else { return false }
-            cost = value
             turnActivity = false
         default: return false
         }
@@ -2870,12 +2864,21 @@ private func rateWindowLabel(_ minutes: Int) -> String {
     return minutes % 60 == 0 ? "\(minutes / 60)h" : "\(minutes)m"
 }
 
-private func nextReset(in usage: UsageSnapshot?) -> RateLimitUsage? {
-    [usage?.primaryLimit, usage?.secondaryLimit]
-        .compactMap { $0 }
-        .compactMap { limit in limit.resetsAt.map { (limit, $0) } }
-        .min { $0.1 < $1.1 }?.0
-}
+private let resetTimeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = .autoupdatingCurrent
+    formatter.timeZone = .autoupdatingCurrent
+    formatter.setLocalizedDateFormatFromTemplate("jm")
+    return formatter
+}()
+
+private let resetDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = .autoupdatingCurrent
+    formatter.timeZone = .autoupdatingCurrent
+    formatter.setLocalizedDateFormatFromTemplate("dMMM")
+    return formatter
+}()
 
 private func usageSummary(_ usage: UsageSnapshot?) -> String {
     guard let usage else { return "" }
@@ -2887,24 +2890,33 @@ private func usageSummary(_ usage: UsageSnapshot?) -> String {
     return parts.joined(separator: " · ")
 }
 
-private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex) -> String {
-    var parts = [agent.displayName]
+private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex, compact: Bool = false) -> String {
+    func window(_ label: String, _ limit: RateLimitUsage?) -> String {
+        let label = compact && label == "weekly" ? "7d" : label
+        guard let limit else { return "\(label) \(compact ? "—" : "unavailable")" }
+        var text = "\(label) \(compactPercent(max(0, 100 - limit.usedPercent)))%\(compact ? "" : " left")"
+        if let date = limit.resetsAt {
+            // Provider timestamps can land just before or after a minute boundary.
+            let minute = Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded() * 60)
+            let day = limit.windowMinutes >= 24 * 60 ? "\(resetDateFormatter.string(from: minute)) " : ""
+            text += " ↻ \(day)\(resetTimeFormatter.string(from: minute))"
+        }
+        return text
+    }
+    var parts = compact ? [] : [agent.displayName]
     if agent == .claude {
         parts += [("5h", usage?.primaryLimit), ("weekly", usage?.secondaryLimit)].map { label, limit in
-            limit.map { "\(label) \(compactPercent(max(0, 100 - $0.usedPercent)))% left" } ?? "\(label) unavailable"
+            window(label, limit)
         }
     } else {
         let limits = [usage?.primaryLimit, usage?.secondaryLimit].compactMap { $0 }
             .sorted { $0.windowMinutes < $1.windowMinutes }
-        parts += limits.isEmpty ? ["usage unavailable"] : limits.map {
-            "\(rateWindowLabel($0.windowMinutes)) \(compactPercent(max(0, 100 - $0.usedPercent)))% left"
+        parts += limits.isEmpty ? [compact ? "—" : "usage unavailable"] : limits.map {
+            window(rateWindowLabel($0.windowMinutes), $0)
         }
     }
-    if let date = nextReset(in: usage)?.resetsAt {
-        parts.append("reset \(date.formatted(.dateTime.month(.abbreviated).day().hour().minute()))")
-    }
     if let reason = usage?.unavailableReason {
-        parts.append(usage?.refreshWarning ?? reason)
+        parts.append(compact ? (reason.hasPrefix("Keychain") ? "🔒" : "⚠") : (usage?.refreshWarning ?? reason))
     }
     return parts.joined(separator: " · ")
 }
@@ -2961,12 +2973,15 @@ private final class IslandView: NSView {
     private var mouthOpen = true
     private var pacmanProgress: CGFloat = 0
     private let rowHeight: CGFloat = 58
-    private var footerLines: [String] {
-        var lines = [remainingUsageSummary(accountUsage), remainingUsageSummary(claudeUsage, agent: .claude)]
+    private var footerLines: [(agent: AgentKind?, text: String)] {
+        var lines: [(agent: AgentKind?, text: String)] = [
+            (.codex, remainingUsageSummary(accountUsage, compact: true)),
+            (.claude, remainingUsageSummary(claudeUsage, agent: .claude, compact: true)),
+        ]
         let sessions = [piUsageSummary(activities), agentUsageSummary(activities),
-            agentUsageSummary(activities, agent: .opencode2), agentUsageSummary(activities, agent: .claude)]
+            agentUsageSummary(activities, agent: .opencode2)]
             .filter { !$0.isEmpty }.joined(separator: " · ")
-        if !sessions.isEmpty { lines.append(sessions) }
+        if !sessions.isEmpty { lines.append((nil, sessions)) }
         return lines
     }
     private var footerHeight: CGFloat { CGFloat(footerLines.count) * 15 + 11 }
@@ -3359,13 +3374,23 @@ private final class IslandView: NSView {
         Palette.mutedInk.withAlphaComponent(0.3).setFill()
         NSRect(x: bodyLeft + 12, y: footerHeight + 5, width: bodyRight - bodyLeft - 24, height: 1).fill()
 
-        for (index, line) in footerLines.enumerated() {
+        let lines = footerLines
+        let font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .medium)
+        for (index, line) in lines.enumerated() {
+            let textWidth = (line.text as NSString).size(withAttributes: [.font: font]).width
+            let iconX = max(bodyLeft + 12, (bodyLeft + bodyRight - textWidth - 18) / 2).rounded(.down)
+            let y = footerHeight - CGFloat(index + 1) * 15
+            if let agent = line.agent {
+                drawAgentSprite(agent: agent, at: NSPoint(x: iconX + 5.25, y: y + 6.75), pixel: 1.5,
+                    color: agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk, running: false)
+            }
+            let textX = line.agent == nil ? bodyLeft + 12 : iconX + 18
             drawText(
-                line,
-                in: NSRect(x: bodyLeft + 12, y: footerHeight - CGFloat(index + 1) * 15, width: bodyRight - bodyLeft - 24, height: 13),
-                font: .monospacedSystemFont(ofSize: 8.5, weight: .medium),
+                line.text,
+                in: NSRect(x: textX, y: y, width: bodyRight - textX - 12, height: 13),
+                font: font,
                 color: index < 2 ? Palette.tertiaryInk : Palette.mutedInk,
-                alignment: .center
+                alignment: line.agent == nil ? .center : .left
             )
         }
     }
@@ -3429,22 +3454,25 @@ private final class IslandView: NSView {
         }
     }
 
-    private func drawPacman(at center: NSPoint, pixel: CGFloat, color: NSColor, open: Bool) {
-        let rows: [UInt8] = open
-            ? [0b0011100, 0b0111110, 0b1111100, 0b1110000, 0b1111100, 0b0111110, 0b0011100]
-            : [0b0011100, 0b0111110, 0b1111110, 0b1111100, 0b1111110, 0b0111110, 0b0011100]
-        let origin = NSPoint(x: center.x - pixel * 3.5, y: center.y - pixel * 3.5)
-        color.setFill()
-        for (y, row) in rows.enumerated() {
-            for x in 0..<7 where row & (1 << (6 - x)) != 0 {
-                NSRect(
-                    x: origin.x + CGFloat(x) * pixel,
-                    y: origin.y + CGFloat(6 - y) * pixel,
-                    width: pixel,
-                    height: pixel
-                ).fill()
-            }
-        }
+    private func drawCodexLogo(at center: NSPoint, pixel: CGFloat, color: NSColor) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        let scale = pixel * 7 / 24
+        context.translateBy(x: center.x - 12 * scale, y: center.y + 12 * scale)
+        context.scaleBy(x: scale, y: -scale)
+        context.setStrokeColor(color.cgColor)
+        context.setLineWidth(2)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        // The circular terminal mark from OpenAI's official Codex IDE extension.
+        context.strokeEllipse(in: CGRect(x: 3, y: 3, width: 18, height: 18))
+        context.move(to: CGPoint(x: 8.5, y: 9.5))
+        context.addLine(to: CGPoint(x: 10, y: 12))
+        context.addLine(to: CGPoint(x: 8.5, y: 14.5))
+        context.move(to: CGPoint(x: 13, y: 14.5))
+        context.addLine(to: CGPoint(x: 16, y: 14.5))
+        context.strokePath()
     }
 
     private func drawPiSymbol(at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
@@ -3503,42 +3531,46 @@ private final class IslandView: NSView {
         )
     }
 
-    private func drawPixelSprite(_ rows: [UInt8], at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
+    private func drawPixelSprite<Row: BinaryInteger>(_ rows: [Row], width: Int = 7, at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
         let origin = NSPoint(
-            x: center.x - pixel * 3.5,
-            y: center.y - pixel * 3.5 + (bob ? pixel : 0)
+            x: center.x - pixel * CGFloat(width) / 2,
+            y: center.y - pixel * CGFloat(rows.count) / 2 + (bob ? pixel : 0)
         )
         color.setFill()
+        let path = NSBezierPath()
         for (y, row) in rows.enumerated() {
-            for x in 0..<7 where row & (1 << (6 - x)) != 0 {
-                NSRect(
+            for x in 0..<width where row & (1 << (width - 1 - x)) != 0 {
+                path.appendRect(NSRect(
                     x: origin.x + CGFloat(x) * pixel,
-                    y: origin.y + CGFloat(6 - y) * pixel,
+                    y: origin.y + CGFloat(rows.count - 1 - y) * pixel,
                     width: pixel,
                     height: pixel
-                ).fill()
+                ))
             }
         }
+        path.fill()
     }
 
     private func drawAgentSprite(agent: AgentKind, at center: NSPoint, pixel: CGFloat, color: NSColor, running: Bool) {
         switch agent {
         case .codex:
-            drawPacman(at: center, pixel: pixel, color: color, open: !running || mouthOpen)
+            drawCodexLogo(at: center, pixel: pixel, color: color)
         case .pi:
             drawPiSymbol(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
         case .opencode, .opencode2:
             drawOpencodeLogo(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
         case .claude:
-            drawPixelSprite([
-                0b0100010,
-                0b0111110,
-                0b1101011,
-                0b1111111,
-                0b0111110,
-                0b0101010,
-                0b0100010,
-            ], at: center, pixel: pixel, color: color, bob: running && mouthOpen)
+            let rows: [UInt16] = [
+                0b001111111100,
+                0b001011110100,
+                0b111111111111,
+                0b111111111111,
+                0b001111111100,
+                0b001111111100,
+                0b001010010100,
+                0b001010010100,
+            ]
+            drawPixelSprite(rows, width: 12, at: center, pixel: pixel * 7 / 12, color: color, bob: running && mouthOpen)
         }
     }
 
@@ -3636,8 +3668,8 @@ private final class IslandView: NSView {
             "\(asking) asking, \(running) running, \(delegating) delegating, \(ready) ready, \(stopped) stopped, \(seen) seen"
                 + (agentCounts.isEmpty ? "" : ", \(agentCounts)")
                 + groups.filter { !$0.children.isEmpty }.map { ", \($0.root.title): \($0.subagentSummary)" }.joined()
-                + ", \(remainingUsageSummary(accountUsage))"
-                + ", \(remainingUsageSummary(claudeUsage, agent: .claude))"
+                + ", \(remainingUsageSummary(accountUsage).replacingOccurrences(of: "↻", with: "resets"))"
+                + ", \(remainingUsageSummary(claudeUsage, agent: .claude).replacingOccurrences(of: "↻", with: "resets"))"
         )
     }
 }
@@ -3887,6 +3919,8 @@ private func runSelfTest() {
            "A failed Claude refresh must keep both percentages and reset times")
     let staleClaudeUsage = effectiveUsage(local: nil, remote: retainedClaudeLimits,
         unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
+    assert(remainingUsageSummary(staleClaudeUsage, agent: .claude, compact: true)
+        == remainingUsageSummary(effectiveUsage(local: nil, remote: claudeLimits), agent: .claude, compact: true) + " · ⚠")
     assert(staleClaudeUsage?.refreshWarning?.contains("last known limits") == true)
     assert(remainingUsageSummary(staleClaudeUsage, agent: .claude).contains("last known limits"))
     let emptyLimits = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":null}"#.utf8))
@@ -3906,13 +3940,25 @@ private func runSelfTest() {
     assert(claudeLimits?.secondary?.usedPercent == 43.25 && claudeLimits?.secondary?.windowMinutes == 10_080)
     assert(claudeLimits?.primary?.resetsAt != nil && claudeLimits?.secondary?.resetsAt != nil)
     let claudeAccountUsage = effectiveUsage(local: nil, remote: claudeLimits)
-    assert(remainingUsageSummary(claudeAccountUsage, agent: .claude).hasPrefix("Claude · 5h 87.5% left · weekly 56.75% left"))
+    assert(remainingUsageSummary(claudeAccountUsage, agent: .claude).components(separatedBy: "↻").count == 3,
+           "Each Claude usage window must show its own reset")
+    let claudeWindowLabels = remainingUsageSummary(claudeAccountUsage, agent: .claude).components(separatedBy: " · ")
+    let fiveHourMinute = claudeTimestampWithoutFraction.date(from: "2026-10-20T18:00:00Z")!
+    let weeklyMinute = claudeTimestampWithoutFraction.date(from: "2026-10-26T18:00:00Z")!
+    assert(claudeWindowLabels == ["Claude",
+        "5h 87.5% left ↻ \(resetTimeFormatter.string(from: fiveHourMinute))",
+        "weekly 56.75% left ↻ \(resetDateFormatter.string(from: weeklyMinute)) \(resetTimeFormatter.string(from: weeklyMinute))"])
+    assert(remainingUsageSummary(claudeAccountUsage, agent: .claude, compact: true) ==
+        "5h 87.5% ↻ \(resetTimeFormatter.string(from: fiveHourMinute)) · 7d 56.75% ↻ \(resetDateFormatter.string(from: weeklyMinute)) \(resetTimeFormatter.string(from: weeklyMinute))")
     let weeklyOnly = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":{"utilization":35}}"#.utf8))
     assert(remainingUsageSummary(effectiveUsage(local: nil, remote: weeklyOnly), agent: .claude)
         == "Claude · 5h unavailable · weekly 65% left")
     assert(remainingUsageSummary(nil, agent: .claude) == "Claude · 5h unavailable · weekly unavailable")
+    assert(remainingUsageSummary(nil, agent: .claude, compact: true) == "5h — · 7d —")
     let lockedClaudeUsage = UsageSnapshot(totalTokens: 0, contextTokens: 0, contextWindow: 0,
         primaryLimit: nil, secondaryLimit: nil, costTotal: nil, unavailableReason: "Keychain approval needed")
+    assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude, compact: true) == "5h — · 7d — · 🔒",
+           "Unavailable Claude usage must identify the Keychain blocker")
     assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude).contains("Keychain approval needed"))
     assert(effectiveUsage(local: nil, remote: nil, unavailableReason: "Keychain approval needed") == lockedClaudeUsage)
     assert(claudeUsageFailure(statusCode: 200, limits: claudeLimits) == nil)
@@ -3924,8 +3970,9 @@ private func runSelfTest() {
     assert(claudeUsageFailure(statusCode: nil, limits: nil)?.contains("connection") == true)
     let failedClaudeUsage = effectiveUsage(local: nil, remote: nil,
         unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
-    assert(remainingUsageSummary(failedClaudeUsage, agent: .claude).contains("rate limited"))
+    assert(remainingUsageSummary(failedClaudeUsage, agent: .claude, compact: true) == "5h — · 7d — · ⚠")
 
+    assert(remainingUsageSummary(nil, compact: true) == "—")
     assert(parseClaudeUsageResponse(Data(#"{"error":"unauthorized"}"#.utf8)) == nil)
     assert(parseClaudeUsageResponse(Data("broken json".utf8)) == nil)
     let invalidWindows = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"35"}}"#.utf8))
@@ -3986,9 +4033,8 @@ private func runSelfTest() {
     assert(updatedMergedUsage?.primaryLimit == remoteRateLimits.primary)
     assert(updatedMergedUsage?.secondaryLimit == remoteRateLimits.secondary)
     assert(usageSummary(parseUsage(usage)) == "ctx 20% · 120k tok")
-    assert(nextReset(in: parseUsage(usage))?.windowMinutes == 300)
     assert(remainingUsageSummary(parseUsage(usage)).contains("5h 87.66% left"))
-    assert(remainingUsageSummary(parseUsage(usage)).contains("reset"))
+    assert(remainingUsageSummary(parseUsage(usage)).contains("↻"))
     assert(relativeAge(Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 3600)) == "1h")
     assert(parseResponse(unrelated) == nil)
     let codexEscalation = Data(#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_escalate","arguments":"{\"cmd\":\"rm -rf /tmp/x\",\"sandbox_permissions\":\"require_escalated\"}"}}"#.utf8)
@@ -4701,8 +4747,8 @@ private func runClaudeSelfTest() {
     state.consume(duration)
     assert(state.event == .completed)
     state.consume(done)
-    state.consume(cost)
-    assert(state.usage?.totalTokens == 378 && state.usage?.contextTokens == 240 && state.usage?.costTotal == 0.04)
+    assert(!state.consume(cost), "Claude API cost estimates must be ignored")
+    assert(state.usage?.totalTokens == 378 && state.usage?.contextTokens == 240 && state.usage?.costTotal == nil)
     assert(state.model == "claude-sonnet-4-6")
     state.consume(record(["type": "assistant", "isApiErrorMessage": true, "message": ["model": "<synthetic>", "content": "API error"]]))
     assert(state.event == .cancelled && state.model == "claude-sonnet-4-6")
@@ -4814,7 +4860,7 @@ private func runClaudeSelfTest() {
     let finished = latest.first { $0.id == "claude-test" }
     assert(finished?.agent == .claude && finished?.source == "cli" && finished?.detail == "All done.")
     assert(finished?.prompt == nil && finished?.usage?.totalTokens == 378)
-    assert(agentUsageSummary([finished!], agent: .claude) == "claude 378 tok · $0.04")
+    assert(agentUsageSummary([finished!], agent: .claude) == "claude 378 tok")
     monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
     assert(waitUntil { latest.first { $0.id == "claude-test" }?.phase == .seen })
     assert(latest.first { $0.id == "desktop-test" }?.phase == .ready)
