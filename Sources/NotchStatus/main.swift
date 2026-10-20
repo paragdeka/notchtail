@@ -2993,7 +2993,7 @@ private final class IslandView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
-        let quit = menu.addItem(withTitle: "Quit Notch Status", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = menu.addItem(withTitle: "Quit notchtail", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }

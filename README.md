@@ -1,4 +1,4 @@
-# Notch Status
+# notchtail
 
 A tiny native macOS status island for Codex, Claude Code (CLI and local Desktop Code sessions), Pi, and **opencode** (v1 and v2 sessions). Pac-Man eats its way across the notch while a local turn is running, turns green when complete, orange-red when stopped, and expands on hover or click to show prompt-first sessions with status, latest response, model, context/token usage, source, project, and grouped subagents.
 
@@ -25,13 +25,15 @@ Requires macOS 13+ and Xcode Command Line Tools.
 ```sh
 make test
 make app
-open dist/NotchStatus.app
+open dist/notchtail.app
 ```
+
+Allow notifications for **notchtail** when prompted. Upgrading from NotchStatus asks again because the renamed app has its own notification identity.
 
 The app has no Dock icon. Click the island or outside it to close; right-click it to quit.
 
 ## Keep it running
 
-Move `dist/NotchStatus.app` to `/Applications`, then add it in **System Settings → General → Login Items**. This uses macOS's native login-item support instead of a background helper.
+Move `dist/notchtail.app` to `/Applications`, then add it in **System Settings → General → Login Items**. This uses macOS's native login-item support instead of a background helper.
 
 By default it reads `~/.codex/sessions`, `~/.claude/projects`, `~/.pi/agent/sessions`, and `~/.local/share/opencode/opencode.db` (both table generations). Shell-defined `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and `XDG_DATA_HOME` are also respected when the app is started from that shell.

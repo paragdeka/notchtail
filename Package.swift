@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "NotchStatus",
+    name: "notchtail",
     platforms: [.macOS(.v13)],
-    products: [.executable(name: "NotchStatus", targets: ["NotchStatus"])],
+    products: [.executable(name: "notchtail", targets: ["NotchStatus"])],
     targets: [
         .executableTarget(
             name: "NotchStatus",
