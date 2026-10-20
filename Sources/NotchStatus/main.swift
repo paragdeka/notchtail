@@ -175,6 +175,13 @@ private struct UsageSnapshot: Equatable {
     let primaryLimit: RateLimitUsage?
     let secondaryLimit: RateLimitUsage?
     let costTotal: Double?
+    var unavailableReason: String? = nil
+
+    var refreshWarning: String? {
+        guard let unavailableReason else { return nil }
+        let prefix = primaryLimit != nil || secondaryLimit != nil ? "Showing last known limits. " : ""
+        return prefix + unavailableReason
+    }
 }
 
 private struct RemoteRateLimits: Equatable {
@@ -182,8 +189,15 @@ private struct RemoteRateLimits: Equatable {
     let secondary: RateLimitUsage?
 }
 
-private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?) -> UsageSnapshot? {
-    guard local != nil || remote != nil else { return nil }
+private func mergedRateLimits(_ current: RemoteRateLimits?, with refreshed: RemoteRateLimits?) -> RemoteRateLimits? {
+    let primary = refreshed?.primary ?? current?.primary
+    let secondary = refreshed?.secondary ?? current?.secondary
+    guard primary != nil || secondary != nil else { return nil }
+    return RemoteRateLimits(primary: primary, secondary: secondary)
+}
+
+private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?, unavailableReason: String? = nil) -> UsageSnapshot? {
+    guard local != nil || remote != nil || unavailableReason != nil else { return nil }
     guard let local else {
         return UsageSnapshot(
             totalTokens: 0,
@@ -191,7 +205,8 @@ private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?) ->
             contextWindow: 0,
             primaryLimit: remote?.primary,
             secondaryLimit: remote?.secondary,
-            costTotal: nil
+            costTotal: nil,
+            unavailableReason: unavailableReason
         )
     }
     return UsageSnapshot(
@@ -200,7 +215,8 @@ private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?) ->
         contextWindow: local.contextWindow,
         primaryLimit: remote?.primary ?? local.primaryLimit,
         secondaryLimit: remote?.secondary ?? local.secondaryLimit,
-        costTotal: local.costTotal
+        costTotal: local.costTotal,
+        unavailableReason: unavailableReason ?? local.unavailableReason
     )
 }
 
@@ -237,6 +253,23 @@ private func parseClaudeUsageResponse(_ data: Data) -> RemoteRateLimits? {
     return RemoteRateLimits(primary: window("five_hour", minutes: 300), secondary: window("seven_day", minutes: 10_080))
 }
 
+private func claudeUsageFailure(statusCode: Int?, limits: RemoteRateLimits?) -> String? {
+    switch statusCode {
+    case 200 where limits?.primary != nil || limits?.secondary != nil:
+        return nil
+    case 200:
+        return "Claude returned no usable limits. Retrying automatically."
+    case 401, 403:
+        return "Claude login expired or lacks usage access. Open Claude Code and sign in again."
+    case 429:
+        return "Claude usage is temporarily rate limited. Retrying automatically."
+    case let status?:
+        return "Claude usage request failed (HTTP \(status)). Retrying automatically."
+    case nil:
+        return "Cannot reach Claude usage. Check your connection; retrying automatically."
+    }
+}
+
 private func parseClaudeAccessToken(_ data: Data) -> String? {
     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let oauth = object["claudeAiOauth"] as? [String: Any],
@@ -245,14 +278,16 @@ private func parseClaudeAccessToken(_ data: Data) -> String? {
     return token
 }
 
-private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> String? {
-    if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !token.isEmpty { return token }
+private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> (token: String?, unavailableReason: String?) {
+    let missingLogin = "Claude login unavailable. Open Claude Code and sign in."
+    if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !token.isEmpty { return (token, nil) }
     let file = home.appendingPathComponent(".credentials.json")
     if FileManager.default.fileExists(atPath: file.path) {
-        return (try? Data(contentsOf: file)).flatMap(parseClaudeAccessToken)
+        let token = (try? Data(contentsOf: file)).flatMap(parseClaudeAccessToken)
+        return (token, token == nil ? missingLogin : nil)
     }
     let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
-    guard home.resolvingSymlinksInPath().path == defaultHome.resolvingSymlinksInPath().path else { return nil }
+    guard home.resolvingSymlinksInPath().path == defaultHome.resolvingSymlinksInPath().path else { return (nil, missingLogin) }
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "Claude Code-credentials",
@@ -267,9 +302,13 @@ private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> String?
         if !allowInteraction { SecKeychainSetUserInteractionAllowed(interactionAllowed.boolValue) }
     }
     var value: CFTypeRef?
-    guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
-          let data = value as? Data else { return nil }
-    return parseClaudeAccessToken(data)
+    let status = SecItemCopyMatching(query as CFDictionary, &value)
+    guard status == errSecSuccess, let data = value as? Data else {
+        if status == errSecItemNotFound { return (nil, missingLogin) }
+        return (nil, "Keychain access required (\(status)). Restart notchtail and choose Always Allow for Claude Code-credentials.")
+    }
+    let token = parseClaudeAccessToken(data)
+    return (token, token == nil ? missingLogin : nil)
 }
 
 private enum TurnEvent: Equatable {
@@ -1082,6 +1121,7 @@ private final class SessionMonitor {
     private var accountUsageFetchAttemptedAt = Date.distantPast
     private var accountUsageTask: URLSessionDataTask?
     private var claudeRateLimits: RemoteRateLimits?
+    private var claudeUsageUnavailableReason: String?
     private var claudeUsageFetchInFlight = false
     private var claudeUsageNextFetchAt = Date.distantPast
     private var claudeUsageTask: URLSessionDataTask?
@@ -2583,11 +2623,8 @@ private struct OpencodeSessionRow {
                 self.accountUsageFetchInFlight = false
                 self.accountUsageTask = nil
                 guard parsed.primary != nil || parsed.secondary != nil else { return }
-                let current = self.remoteRateLimits
-                self.remoteRateLimits = RemoteRateLimits(
-                    primary: parsed.primary ?? current?.primary,
-                    secondary: parsed.secondary ?? current?.secondary
-                )
+                self.remoteRateLimits = mergedRateLimits(self.remoteRateLimits, with: RemoteRateLimits(
+                    primary: parsed.primary, secondary: parsed.secondary))
                 self.publish()
             }
         }
@@ -2601,19 +2638,25 @@ private struct OpencodeSessionRow {
         let callbackGeneration = generation
         let allowInteraction = !claudeKeychainAccessRequested
         claudeKeychainAccessRequested = true
+        if allowInteraction {
+            claudeUsageUnavailableReason = "Keychain access pending. Choose Always Allow for Claude Code-credentials in the macOS prompt."
+        }
         let home = claudeHome
         // A Keychain approval must not block the session watcher or app shutdown.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let token = loadClaudeAccessToken(home: home, allowInteraction: allowInteraction)
+            let credential = loadClaudeAccessToken(home: home, allowInteraction: allowInteraction)
             self?.queue.async { [weak self] in
                 guard let self, self.active, self.generation == callbackGeneration else { return }
-                guard let token else {
+                let previousReason = self.claudeUsageUnavailableReason
+                guard let token = credential.token else {
                     self.claudeUsageFetchInFlight = false
-                    if self.claudeRateLimits != nil {
-                        self.claudeRateLimits = nil
-                        self.publish()
-                    }
+                    self.claudeUsageUnavailableReason = credential.unavailableReason
+                    self.publish()
                     return
+                }
+                if self.claudeRateLimits == nil {
+                    self.claudeUsageUnavailableReason = nil
+                    if previousReason != nil { self.publish() }
                 }
                 var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
                 request.httpMethod = "GET"
@@ -2633,10 +2676,9 @@ private struct OpencodeSessionRow {
                             self.claudeUsageNextFetchAt = Date().addingTimeInterval(delay.isFinite ? max(60, delay) : 300)
                         }
                         let parsed = http?.statusCode == 200 ? data.flatMap(parseClaudeUsageResponse) : nil
-                        if self.claudeRateLimits != parsed {
-                            self.claudeRateLimits = parsed
-                            self.publish()
-                        }
+                        self.claudeUsageUnavailableReason = claudeUsageFailure(statusCode: http?.statusCode, limits: parsed)
+                        self.claudeRateLimits = mergedRateLimits(self.claudeRateLimits, with: parsed)
+                        self.publish()
                     }
                 }
                 self.claudeUsageTask?.resume()
@@ -2688,7 +2730,7 @@ private struct OpencodeSessionRow {
             return $0.updatedAt > $1.updatedAt
         }
         let usage = effectiveUsage(local: nativeUsage, remote: remoteRateLimits)
-        let claudeUsage = effectiveUsage(local: nil, remote: claudeRateLimits)
+        let claudeUsage = effectiveUsage(local: nil, remote: claudeRateLimits, unavailableReason: claudeUsageUnavailableReason)
         let callbackGeneration = generation
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
@@ -2861,6 +2903,9 @@ private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .
     if let date = nextReset(in: usage)?.resetsAt {
         parts.append("reset \(date.formatted(.dateTime.month(.abbreviated).day().hour().minute()))")
     }
+    if let reason = usage?.unavailableReason {
+        parts.append(usage?.refreshWarning ?? reason)
+    }
     return parts.joined(separator: " · ")
 }
 
@@ -2941,6 +2986,7 @@ private final class IslandView: NSView {
         self.activities = activities
         self.accountUsage = accountUsage
         self.claudeUsage = claudeUsage
+        toolTip = claudeUsage?.refreshWarning
         expandedGroupIDs.formIntersection(groupActivities(activities).map { activityUIIdentity($0.root) })
         expandedGroupIDs.formUnion(groupActivities(activities).filter {
             !previousGroups.contains($0.root.key) && $0.children.contains { $0.phase == .running }
@@ -3834,6 +3880,28 @@ private func runSelfTest() {
     assert(parseCodexUsageResponse(accountResponse)?.secondary == nil)
     let claudeResponse = Data(#"{"five_hour":{"utilization":12.5,"resets_at":"2026-10-20T18:00:00.123Z"},"seven_day":{"utilization":43.25,"resets_at":"2026-10-26T18:00:00Z"}}"#.utf8)
     let claudeLimits = parseClaudeUsageResponse(claudeResponse)
+    var retainedClaudeLimits = mergedRateLimits(nil, with: claudeLimits)
+    retainedClaudeLimits = mergedRateLimits(retainedClaudeLimits,
+        with: parseClaudeUsageResponse(Data(#"{"error":{"type":"rate_limit_error"}}"#.utf8)))
+    assert(retainedClaudeLimits == claudeLimits,
+           "A failed Claude refresh must keep both percentages and reset times")
+    let staleClaudeUsage = effectiveUsage(local: nil, remote: retainedClaudeLimits,
+        unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
+    assert(staleClaudeUsage?.refreshWarning?.contains("last known limits") == true)
+    assert(remainingUsageSummary(staleClaudeUsage, agent: .claude).contains("last known limits"))
+    let emptyLimits = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":null}"#.utf8))
+    assert(mergedRateLimits(retainedClaudeLimits, with: emptyLimits) == claudeLimits)
+    assert(mergedRateLimits(nil, with: emptyLimits) == nil)
+    assert(mergedRateLimits(nil, with: nil) == nil)
+    let refreshedFiveHour = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":20,"resets_at":"2026-10-21T00:00:00Z"},"seven_day":null}"#.utf8))
+    retainedClaudeLimits = mergedRateLimits(retainedClaudeLimits, with: refreshedFiveHour)
+    assert(retainedClaudeLimits?.primary == refreshedFiveHour?.primary)
+    assert(retainedClaudeLimits?.secondary == claudeLimits?.secondary,
+           "A partial response must retain the other window and its reset time")
+    let recoveredClaudeLimits = mergedRateLimits(retainedClaudeLimits, with: claudeLimits)
+    let recoveredClaudeUsage = effectiveUsage(local: nil, remote: recoveredClaudeLimits,
+        unavailableReason: claudeUsageFailure(statusCode: 200, limits: claudeLimits))
+    assert(recoveredClaudeUsage?.refreshWarning == nil && recoveredClaudeLimits == claudeLimits)
     assert(claudeLimits?.primary?.usedPercent == 12.5 && claudeLimits?.primary?.windowMinutes == 300)
     assert(claudeLimits?.secondary?.usedPercent == 43.25 && claudeLimits?.secondary?.windowMinutes == 10_080)
     assert(claudeLimits?.primary?.resetsAt != nil && claudeLimits?.secondary?.resetsAt != nil)
@@ -3843,6 +3911,21 @@ private func runSelfTest() {
     assert(remainingUsageSummary(effectiveUsage(local: nil, remote: weeklyOnly), agent: .claude)
         == "Claude · 5h unavailable · weekly 65% left")
     assert(remainingUsageSummary(nil, agent: .claude) == "Claude · 5h unavailable · weekly unavailable")
+    let lockedClaudeUsage = UsageSnapshot(totalTokens: 0, contextTokens: 0, contextWindow: 0,
+        primaryLimit: nil, secondaryLimit: nil, costTotal: nil, unavailableReason: "Keychain approval needed")
+    assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude).contains("Keychain approval needed"))
+    assert(effectiveUsage(local: nil, remote: nil, unavailableReason: "Keychain approval needed") == lockedClaudeUsage)
+    assert(claudeUsageFailure(statusCode: 200, limits: claudeLimits) == nil)
+    assert(claudeUsageFailure(statusCode: 200, limits: nil)?.contains("no usable limits") == true)
+    assert(claudeUsageFailure(statusCode: 401, limits: nil)?.contains("sign in again") == true)
+    assert(claudeUsageFailure(statusCode: 403, limits: nil)?.contains("sign in again") == true)
+    assert(claudeUsageFailure(statusCode: 429, limits: nil)?.contains("rate limited") == true)
+    assert(claudeUsageFailure(statusCode: 503, limits: nil)?.contains("HTTP 503") == true)
+    assert(claudeUsageFailure(statusCode: nil, limits: nil)?.contains("connection") == true)
+    let failedClaudeUsage = effectiveUsage(local: nil, remote: nil,
+        unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
+    assert(remainingUsageSummary(failedClaudeUsage, agent: .claude).contains("rate limited"))
+
     assert(parseClaudeUsageResponse(Data(#"{"error":"unauthorized"}"#.utf8)) == nil)
     assert(parseClaudeUsageResponse(Data("broken json".utf8)) == nil)
     let invalidWindows = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"35"}}"#.utf8))
