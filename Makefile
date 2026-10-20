@@ -13,5 +13,10 @@ app: build
 run:
 	swift run NotchStatus
 
+restart: app
+	pkill -x NotchStatus || true
+	sleep 1
+	open dist/NotchStatus.app
+
 test:
 	swift run NotchStatus --self-test

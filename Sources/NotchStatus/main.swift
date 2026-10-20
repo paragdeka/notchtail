@@ -2,26 +2,59 @@ import AppKit
 import CoreServices
 import Darwin
 import Foundation
+import Security
 import SQLite3
 import UserNotifications
 
 private enum ThreadPhase: Equatable {
     case running
+    case delegating
     case ready
     case stopped
     case seen
+}
+
+// A blocking question or permission request the agent is waiting on. Read-only:
+// the notch surfaces it, the user answers in the agent's own surface.
+private struct AgentPrompt: Equatable {
+    enum Kind: Equatable {
+        case question
+        case permission
+    }
+
+    let kind: Kind
+    let tool: String
+    let text: String
+    let callID: String
+
+    var line: String {
+        switch kind {
+        case .question:
+            return text.isEmpty ? "asked a question" : text
+        case .permission:
+            return text.isEmpty ? "allow \(tool)?" : "\(tool): \(text)"
+        }
+    }
+
+    var verb: String {
+        kind == .question ? "Asked a question" : "Waiting for permission"
+    }
 }
 
 private enum AgentKind: Equatable {
     case codex
     case pi
     case opencode
+    case opencode2
+    case claude
 
     var label: String {
         switch self {
         case .codex: return "codex"
         case .pi: return "pi"
         case .opencode: return "opencode"
+        case .opencode2: return "opencode2"
+        case .claude: return "claude"
         }
     }
 
@@ -30,6 +63,8 @@ private enum AgentKind: Equatable {
         case .codex: return "Codex"
         case .pi: return "Pi"
         case .opencode: return "opencode"
+        case .opencode2: return "opencode2"
+        case .claude: return "Claude"
         }
     }
 }
@@ -38,6 +73,7 @@ private let activityRetention: TimeInterval = 15 * 60
 private let runningInactivityTimeout: TimeInterval = 6 * 60 * 60
 private let piRunningInactivityTimeout: TimeInterval = 30 * 60
 private let opencodeRunningInactivityTimeout: TimeInterval = 30 * 60
+private let claudeRunningInactivityTimeout: TimeInterval = 30 * 60
 
 private func shouldRetain(_ phase: ThreadPhase, updatedAt: Date, now: Date = Date()) -> Bool {
     phase == .running || now.timeIntervalSince(updatedAt) < activityRetention
@@ -55,9 +91,10 @@ private func shouldMarkStopped(
 private func phaseRank(_ phase: ThreadPhase) -> Int {
     switch phase {
     case .running: return 0
-    case .stopped: return 1
-    case .ready: return 2
-    case .seen: return 3
+    case .delegating: return 1
+    case .stopped: return 2
+    case .ready: return 3
+    case .seen: return 4
     }
 }
 
@@ -87,6 +124,7 @@ private struct ThreadActivity: Equatable {
     let usage: UsageSnapshot?
     var phase: ThreadPhase
     var updatedAt: Date
+    var prompt: AgentPrompt? = nil
 
     var key: String { "\(agent.label):\(id)" }
     var runningTimeout: TimeInterval {
@@ -94,7 +132,22 @@ private struct ThreadActivity: Equatable {
         case .codex: return runningInactivityTimeout
         case .pi: return piRunningInactivityTimeout
         case .opencode: return opencodeRunningInactivityTimeout
+        case .opencode2: return opencodeRunningInactivityTimeout
+        case .claude: return claudeRunningInactivityTimeout
         }
+    }
+}
+
+private func activityUIIdentity(_ activity: ThreadActivity) -> String {
+    activity.key
+}
+
+private func agentRowLabel(_ agent: AgentKind) -> String? {
+    switch agent {
+    case .opencode: return "oc"
+    case .opencode2: return "oc2"
+    case .claude: return "claude"
+    case .codex, .pi: return nil
     }
 }
 
@@ -124,6 +177,101 @@ private struct UsageSnapshot: Equatable {
     let costTotal: Double?
 }
 
+private struct RemoteRateLimits: Equatable {
+    let primary: RateLimitUsage?
+    let secondary: RateLimitUsage?
+}
+
+private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?) -> UsageSnapshot? {
+    guard local != nil || remote != nil else { return nil }
+    guard let local else {
+        return UsageSnapshot(
+            totalTokens: 0,
+            contextTokens: 0,
+            contextWindow: 0,
+            primaryLimit: remote?.primary,
+            secondaryLimit: remote?.secondary,
+            costTotal: nil
+        )
+    }
+    return UsageSnapshot(
+        totalTokens: local.totalTokens,
+        contextTokens: local.contextTokens,
+        contextWindow: local.contextWindow,
+        primaryLimit: remote?.primary ?? local.primaryLimit,
+        secondaryLimit: remote?.secondary ?? local.secondaryLimit,
+        costTotal: local.costTotal
+    )
+}
+
+private struct OpencodeStore {
+    let databaseURL: URL
+}
+
+private func parseCodexUsageResponse(_ data: Data) -> (primary: RateLimitUsage?, secondary: RateLimitUsage?)? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let rateLimit = object["rate_limit"] as? [String: Any] else { return nil }
+    func parse(_ value: Any?) -> RateLimitUsage? {
+        guard let window = value as? [String: Any],
+              let used = (window["used_percent"] as? NSNumber)?.doubleValue,
+              let seconds = (window["limit_window_seconds"] as? NSNumber)?.doubleValue else { return nil }
+        let reset = (window["reset_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+        return RateLimitUsage(usedPercent: used, windowMinutes: Int((seconds / 60).rounded()), resetsAt: reset)
+    }
+    return (parse(rateLimit["primary_window"]), parse(rateLimit["secondary_window"]))
+}
+
+private func parseClaudeUsageResponse(_ data: Data) -> RemoteRateLimits? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["five_hour"] != nil || object["seven_day"] != nil else { return nil }
+    func window(_ key: String, minutes: Int) -> RateLimitUsage? {
+        guard let value = object[key] as? [String: Any],
+              let number = value["utilization"] as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue >= 0 else { return nil }
+        let reset = (value["resets_at"] as? String).flatMap {
+            claudeTimestamp.date(from: $0) ?? claudeTimestampWithoutFraction.date(from: $0)
+        }
+        return RateLimitUsage(usedPercent: number.doubleValue, windowMinutes: minutes, resetsAt: reset)
+    }
+    return RemoteRateLimits(primary: window("five_hour", minutes: 300), secondary: window("seven_day", minutes: 10_080))
+}
+
+private func parseClaudeAccessToken(_ data: Data) -> String? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let oauth = object["claudeAiOauth"] as? [String: Any],
+          let token = oauth["accessToken"] as? String,
+          !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    return token
+}
+
+private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> String? {
+    if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !token.isEmpty { return token }
+    let file = home.appendingPathComponent(".credentials.json")
+    if FileManager.default.fileExists(atPath: file.path) {
+        return (try? Data(contentsOf: file)).flatMap(parseClaudeAccessToken)
+    }
+    let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+    guard home.resolvingSymlinksInPath().path == defaultHome.resolvingSymlinksInPath().path else { return nil }
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "Claude Code-credentials",
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    // Legacy generic-password ACLs can ignore LAContext's no-interaction policy.
+    var interactionAllowed = DarwinBoolean(true)
+    SecKeychainGetUserInteractionAllowed(&interactionAllowed)
+    if !allowInteraction { SecKeychainSetUserInteractionAllowed(false) }
+    defer {
+        if !allowInteraction { SecKeychainSetUserInteractionAllowed(interactionAllowed.boolValue) }
+    }
+    var value: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
+          let data = value as? Data else { return nil }
+    return parseClaudeAccessToken(data)
+}
+
 private enum TurnEvent: Equatable {
     case started
     case completed
@@ -142,6 +290,16 @@ private struct SessionSnapshot {
 private func condensedText(_ message: String) -> String? {
     let condensed = message.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
     return condensed.isEmpty ? nil : String(condensed.prefix(240))
+}
+
+private func isOpencodeDefaultTitle(_ title: String) -> Bool {
+    // Mirrors opencode's `isDefaultTitle`: auto titles like
+    // "New session - 2026-09-15T07:44:54.967Z" carry no meaning, so the row
+    // falls back to the user message instead.
+    title.range(
+        of: "^(New session - |Child session - )\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+        options: .regularExpression
+    ) != nil
 }
 
 private let taskNeedle = Data("\"payload\":{\"type\":\"task_".utf8)
@@ -228,6 +386,44 @@ private func parseUsage(_ line: Data) -> UsageSnapshot? {
     )
 }
 
+// Codex persists protocol response items even when the UI that owns the
+// approval is not running. Keep these waits read-only and correlate results by
+// call id so an old approval cannot remain visible after the tool finishes.
+private func parseCodexPendingPrompt(_ line: Data) -> AgentPrompt? {
+    guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+    let outerPayload = object["payload"] as? [String: Any]
+    let item = ((outerPayload?["type"] as? String) == "response_item" ? outerPayload?["payload"] as? [String: Any] : outerPayload) ?? object
+    let type = item["type"] as? String ?? ""
+    let callID = item["call_id"] as? String ?? item["callId"] as? String ?? item["id"] as? String ?? ""
+    guard !callID.isEmpty else { return nil }
+    let arguments: [String: Any]
+    if let value = item["arguments"] as? [String: Any] { arguments = value }
+    else if let value = item["arguments"] as? String,
+            let data = value.data(using: .utf8),
+            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { arguments = parsed }
+    else { arguments = [:] }
+    let requestInput = type == "request_user_input" || type == "user_input_request"
+        || (type == "function_call" && (item["name"] as? String) == "request_user_input")
+    if requestInput {
+        let source = arguments.isEmpty ? item : arguments
+        let text = (source["questions"] as? [[String: Any]])?.compactMap { $0["question"] as? String }.first
+            ?? source["question"] as? String ?? source["prompt"] as? String ?? ""
+        return AgentPrompt(kind: .question, tool: "request_user_input", text: String(text.prefix(160)), callID: callID)
+    }
+    guard type == "function_call", (item["name"] as? String) == "exec_command" else { return nil }
+    guard (arguments["sandbox_permissions"] as? String) == "require_escalated" else { return nil }
+    let text = arguments["command"] as? String ?? arguments["cmd"] as? String ?? ""
+    return AgentPrompt(kind: .permission, tool: "exec_command", text: String(text.prefix(160)), callID: callID)
+}
+
+private func parseCodexResolvedCallID(_ line: Data) -> String? {
+    guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+    let item = (object["payload"] as? [String: Any]) ?? object
+    let type = item["type"] as? String ?? ""
+    guard type == "function_call_output" || type == "function_call_result" || type == "response_item_output" else { return nil }
+    return item["call_id"] as? String ?? item["callId"] as? String
+}
+
 // MARK: - Pi session parsing
 
 private enum PiEvent {
@@ -283,6 +479,139 @@ private func piTextContent(_ content: Any?) -> String? {
         .compactMap { $0["text"] as? String }
         .joined(separator: " ")
     return condensedText(text)
+}
+
+// Claude writes several content blocks with the same message ID and cumulative usage.
+private struct ClaudeSessionState {
+    var event: TurnEvent?
+    var prompt: String?
+    var response: String?
+    var model: String?
+    var name: String?
+    var source: String?
+    var updatedAt: Date?
+    var pending: [String: AgentPrompt] = [:]
+    private var messageTokens: [String: Int] = [:]
+    private var totalTokens = 0
+    private var contextTokens = 0
+    private var cost: Double?
+
+    var usage: UsageSnapshot? {
+        guard !messageTokens.isEmpty || cost != nil else { return nil }
+        return UsageSnapshot(totalTokens: totalTokens, contextTokens: contextTokens, contextWindow: 0,
+                             primaryLimit: nil, secondaryLimit: nil, costTotal: cost)
+    }
+
+    @discardableResult
+    mutating func consume(_ line: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let type = object["type"] as? String else { return false }
+        if let entrypoint = object["entrypoint"] as? String {
+            source = claudeSource(entrypoint)
+        }
+        let message = object["message"] as? [String: Any] ?? [:]
+        let content = message["content"]
+        let blocks = content as? [[String: Any]] ?? []
+        let text = piTextContent(content)
+        var turnActivity = true
+
+        switch type {
+        case "user":
+            let results = blocks.filter { ($0["type"] as? String) == "tool_result" }
+            for result in results {
+                if let id = result["tool_use_id"] as? String { pending.removeValue(forKey: id) }
+            }
+            let interrupted = (object["toolUseResult"] as? [String: Any])?["interrupted"] as? Bool == true
+                || text?.hasPrefix("[Request interrupted by user") == true
+            if interrupted {
+                event = .cancelled
+                pending.removeAll()
+            } else if !results.isEmpty {
+                if event != .cancelled { event = .started }
+            } else {
+                guard object["isMeta"] as? Bool != true,
+                      object["isCompactSummary"] as? Bool != true,
+                      text?.hasPrefix("<local-command-") != true,
+                      text?.hasPrefix("<command-name>") != true else { return false }
+                prompt = text
+                response = nil
+                pending.removeAll()
+                event = .started
+            }
+        case "assistant":
+            if let value = message["model"] as? String, value != "<synthetic>" { model = value }
+            if let text { response = text }
+            if let usage = message["usage"] as? [String: Any],
+               let id = message["id"] as? String ?? object["uuid"] as? String {
+                func tokens(_ key: String) -> Int { max(0, (usage[key] as? NSNumber)?.intValue ?? 0) }
+                let input = tokens("input_tokens") + tokens("cache_read_input_tokens") + tokens("cache_creation_input_tokens")
+                let count = input + tokens("output_tokens")
+                let previous = messageTokens[id] ?? 0
+                messageTokens[id] = max(previous, count)
+                totalTokens += max(0, count - previous)
+                contextTokens = count
+            }
+            for block in blocks where block["type"] as? String == "tool_use" {
+                guard let id = block["id"] as? String, let tool = block["name"] as? String,
+                      tool == "AskUserQuestion" || tool == "ExitPlanMode" else { continue }
+                let input = block["input"] as? [String: Any] ?? [:]
+                let question = (input["questions"] as? [[String: Any]])?.first?["question"] as? String
+                pending[id] = AgentPrompt(kind: tool == "AskUserQuestion" ? .question : .permission,
+                    tool: tool, text: condensedText(question ?? input["plan"] as? String ?? "") ?? "", callID: id)
+            }
+            if object["isApiErrorMessage"] as? Bool == true {
+                event = .cancelled
+            } else {
+                switch message["stop_reason"] as? String {
+                case "end_turn", "max_tokens", "stop_sequence", "refusal":
+                    // Earlier thinking blocks also carry the message's final stop reason.
+                    let thinkingOnly = !blocks.isEmpty && blocks.allSatisfy {
+                        let type = $0["type"] as? String
+                        return type == "thinking" || type == "redacted_thinking"
+                    }
+                    event = thinkingOnly ? .started : .completed
+                default: event = .started
+                }
+            }
+            if event != .started { pending.removeAll() }
+        case "system":
+            guard object["subtype"] as? String == "turn_duration", event != nil else { return false }
+            // Some Claude versions persist null stop reasons even on their final reply.
+            if event != .cancelled { event = .completed }
+            pending.removeAll()
+        case "progress":
+            guard event == .started else { return false }
+        case "custom-title":
+            guard let value = object["customTitle"] as? String else { return false }
+            name = condensedText(value)
+            turnActivity = false
+        case "cost-state":
+            guard let value = (object["totalCostUSD"] as? NSNumber)?.doubleValue,
+                  value.isFinite, value >= 0 else { return false }
+            cost = value
+            turnActivity = false
+        default: return false
+        }
+        if turnActivity {
+            updatedAt = (object["timestamp"] as? String).flatMap {
+                claudeTimestamp.date(from: $0) ?? claudeTimestampWithoutFraction.date(from: $0)
+            } ?? Date()
+        }
+        return true
+    }
+}
+
+private let claudeTimestamp: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
+private let claudeTimestampWithoutFraction = ISO8601DateFormatter()
+
+private func claudeSource(_ entrypoint: String) -> String {
+    if entrypoint.contains("desktop") { return "desktop" }
+    if entrypoint.contains("vscode") { return "extension" }
+    return "cli"
 }
 
 private func parsePiUsage(_ value: Any?) -> PiUsage? {
@@ -354,12 +683,50 @@ private func piTurnEvent(_ event: PiEvent) -> TurnEvent? {
     }
 }
 
+// pi writes assistant toolCall blocks before executing them; while an ask-type
+// tool waits for the user there is no matching toolResult entry yet.
+private let piToolCallNeedle = Data("\"type\":\"toolCall\"".utf8)
+private let piToolResultNeedle = Data("\"role\":\"toolResult\"".utf8)
+
+private func piAskText(_ arguments: [String: Any]) -> String {
+    for key in ["question", "prompt", "title", "message", "text"] {
+        if let value = arguments[key] as? String, !value.isEmpty {
+            return String(value.prefix(160))
+        }
+    }
+    return ""
+}
+
+private func parsePiToolCalls(_ line: Data) -> [(id: String, name: String, text: String, permission: Bool)]? {
+    guard line.range(of: piToolCallNeedle) != nil,
+          let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+          let message = object["message"] as? [String: Any],
+          message["role"] as? String == "assistant",
+          let blocks = message["content"] as? [[String: Any]] else { return nil }
+
+    let calls = blocks.filter { $0["type"] as? String == "toolCall" }.compactMap { block -> (String, String, String, Bool)? in
+        guard let id = block["id"] as? String, let name = block["name"] as? String else { return nil }
+        let arguments = block["arguments"] as? [String: Any] ?? [:]
+        return (id, name, piAskText(arguments), isPermissionToolName(name))
+    }
+    return calls.isEmpty ? nil : calls
+}
+
+private func parsePiToolResultID(_ line: Data) -> String? {
+    guard line.range(of: piToolResultNeedle) != nil,
+          let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+          let message = object["message"] as? [String: Any],
+          message["role"] as? String == "toolResult" else { return nil }
+    return message["toolCallId"] as? String
+}
+
 // MARK: - opencode session parsing
 
 private struct OpencodeMessageHeader {
     let role: String
     let completed: Bool
     let aborted: Bool
+    let finish: String?
     let modelID: String?
     let variant: String?
     let contextTokens: Int
@@ -375,10 +742,12 @@ private func parseOpencodeMessageHeader(_ data: Data) -> OpencodeMessageHeader? 
     let cache = tokens?["cache"] as? [String: Any]
 
     func number(_ value: Any?) -> Int { (value as? NSNumber)?.intValue ?? 0 }
+    let completed = (time?["completed"] as? NSNumber) != nil
     return OpencodeMessageHeader(
         role: role,
-        completed: time?["completed"] != nil,
+        completed: completed,
         aborted: errorName.contains("Abort"),
+        finish: object["finish"] as? String,
         modelID: object["modelID"] as? String,
         variant: object["variant"] as? String,
         contextTokens: number(tokens?["input"]) + number(tokens?["output"])
@@ -390,8 +759,11 @@ private func opencodeTurnEvent(_ header: OpencodeMessageHeader?) -> TurnEvent? {
     guard let header else { return nil }
     if header.role == "user" { return .started }
     guard header.role == "assistant" else { return nil }
+    if header.aborted { return .cancelled }
     if !header.completed { return .started }
-    return header.aborted ? .cancelled : .completed
+    // a reply that ended in tool calls only finished one segment; the turn keeps running
+    if header.finish == "tool-calls" || header.finish == "tool_calls" { return .started }
+    return .completed
 }
 
 private func opencodeModelLabel(modelID: String?, variant: String?) -> String? {
@@ -403,6 +775,194 @@ private func opencodeModelLabel(modelID: String?, variant: String?) -> String? {
 private func opencodeSessionModel(_ json: String) -> String? {
     guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else { return nil }
     return opencodeModelLabel(modelID: object["id"] as? String, variant: object["variant"] as? String)
+}
+
+// MARK: - agent prompts (questions / permission asks)
+
+// Tools whose "running with input but no progress" state means the agent is
+// parked on a permission dialog. Long-running silent tools (webfetch, grep,
+// subagent `task`) are excluded on purpose: they look identical while executing.
+private let opencodePermissionTools: Set<String> = [
+    "bash", "shell", "edit", "write", "read", "apply_patch", "multiedit", "ls"
+]
+private let opencodePromptDebounce: TimeInterval = 5
+private let opencodeWaitingStatuses: Set<String> = ["pending", "streaming", "running"]
+
+private func isAskToolName(_ name: String) -> Bool {
+    let lowered = name.lowercased()
+    if lowered.hasPrefix("ask") || lowered.hasPrefix("question") { return true }
+    return lowered.contains("ask_user") || lowered.contains("ask-user") || lowered.hasSuffix("-ask")
+        || lowered.contains("question") || lowered.contains("confirm") || lowered.contains("approval")
+        || lowered.contains("permission") || lowered.contains("request_permission") || lowered.contains("request-permission")
+        || lowered.contains("request_user_input") || lowered.contains("request-user-input")
+        || lowered.contains("user_input") || lowered.contains("user-input") || lowered.contains("input_request")
+}
+
+private func isPermissionToolName(_ name: String) -> Bool {
+    let lowered = name.lowercased()
+    return lowered.contains("permission") || lowered.contains("approval") || lowered.contains("confirm")
+        || lowered.contains("authorize") || lowered.contains("request_permission") || lowered.contains("request-permission")
+}
+
+private struct OpencodeToolObservation {
+    let callID: String
+    let name: String
+    let status: String
+    let input: [String: Any]
+    let progressed: Bool
+    let createdAt: Date
+}
+
+// opencode logs every permission dialog it shows ("message=asking id=per_...")
+// to its run log. Correlating those events with a stalled tool part is what
+// separates "parked on the user" from "running a silent command".
+private struct OpencodeAskingEvent: Equatable {
+    let id: String
+    let permission: String
+    let at: Date
+}
+
+private func parseOpencodePending(id: String, type: String, data: String?) -> AgentPrompt? {
+    let object = data.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] } ?? [:]
+    var candidates: [[String: Any]] = [object]
+    var index = 0
+    while index < candidates.count {
+        let candidate = candidates[index]
+        for key in ["request", "data", "payload"] {
+            if let nested = candidate[key] as? [String: Any] { candidates.append(nested) }
+        }
+        index += 1
+    }
+    let kinds = ([type] + candidates.compactMap { $0["type"] as? String }).joined(separator: " ").lowercased()
+    let questionType = kinds.contains("question") || kinds.contains("form")
+    let hasQuestions = candidates.contains { $0["questions"] != nil || $0["fields"] != nil || $0["question"] != nil }
+    if questionType || hasQuestions {
+        let text = candidates.compactMap { candidate -> String? in
+            if let questions = candidate["questions"] as? [[String: Any]] {
+                return questions.compactMap { $0["question"] as? String }.first
+            }
+            if let fields = candidate["fields"] as? [[String: Any]] {
+                return fields.compactMap { ($0["label"] as? String) ?? ($0["name"] as? String) }.first
+            }
+            return candidate["question"] as? String
+        }.first ?? ""
+        return AgentPrompt(kind: .question, tool: type, text: String(text.prefix(160)), callID: id)
+    }
+    let permissionType = kinds.contains("permission") || kinds.contains("approval") || kinds.contains("external_directory")
+    let hasPermissionData = candidates.contains { candidate in
+        ["permission", "action", "resources", "resource", "command", "path", "pattern"].contains { candidate[$0] != nil }
+    }
+    guard permissionType || hasPermissionData else { return nil }
+    let permission = candidates.compactMap { ($0["permission"] as? String) ?? ($0["action"] as? String) }.first ?? type
+    let text = candidates.compactMap { candidate in
+        (candidate["command"] as? String) ?? (candidate["path"] as? String) ?? (candidate["pattern"] as? String)
+    }.first ?? ""
+    return AgentPrompt(kind: .permission, tool: permission, text: String(text.prefix(160)), callID: id)
+}
+
+private func parseOpencodeAskingLine(_ line: String) -> OpencodeAskingEvent? {
+    guard line.contains("message=asking"),
+          let idRange = line.range(of: " id=") else { return nil }
+    let id = String(line[idRange.upperBound...].prefix { $0 != " " })
+    guard id.hasPrefix("per_") else { return nil }
+    let permission = line.range(of: " permission=")
+        .map { String(line[$0.upperBound...].prefix { $0 != " " }) } ?? ""
+    let timestamp = line.range(of: "timestamp=")
+        .map { String(line[$0.upperBound...].prefix(24)) } ?? ""
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let plain = ISO8601DateFormatter()
+    guard let date = fractional.date(from: timestamp) ?? plain.date(from: timestamp) else { return nil }
+    return OpencodeAskingEvent(id: id, permission: permission, at: date)
+}
+
+private func promptText(tool: String, input: [String: Any]) -> String {
+    if tool == "question" {
+        let questions = (input["questions"] as? [[String: Any]]) ?? []
+        let text = questions.compactMap { $0["question"] as? String }.first { !$0.isEmpty }
+        if let text { return String(text.prefix(160)) }
+    }
+    for key in ["command", "filePath", "path", "pattern", "url"] {
+        if let value = input[key] as? String, !value.isEmpty {
+            return String(value.prefix(160))
+        }
+    }
+    return ""
+}
+
+private func opencodePrompt(
+    from tools: [OpencodeToolObservation],
+    askingEvents: [OpencodeAskingEvent],
+    now: Date = Date()
+) -> AgentPrompt? {
+    for tool in tools
+        where tool.name == "question"
+        && !tool.input.isEmpty
+        && opencodeWaitingStatuses.contains(tool.status) {
+        return AgentPrompt(
+            kind: .question,
+            tool: tool.name,
+            text: promptText(tool: tool.name, input: tool.input),
+            callID: tool.callID
+        )
+    }
+    for tool in tools
+    where opencodePermissionTools.contains(tool.name)
+        && opencodeWaitingStatuses.contains(tool.status)
+        && !tool.progressed
+        && now.timeIntervalSince(tool.createdAt) >= opencodePromptDebounce
+        && askingEvents.contains(where: { event in
+            let skew = event.at.timeIntervalSince(tool.createdAt)
+            return skew > -5 && skew < 30
+        }) {
+        return AgentPrompt(
+            kind: .permission,
+            tool: tool.name,
+            text: promptText(tool: tool.name, input: tool.input),
+            callID: tool.callID
+        )
+    }
+    return nil
+}
+
+private struct OpencodeV2Message {
+    let id: String
+    let header: OpencodeMessageHeader
+    let text: String?
+}
+
+private func parseOpencodeV2Message(id: String, role: String, data: Data) -> OpencodeV2Message? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let time = object["time"] as? [String: Any]
+    let errorName = ((object["error"] as? [String: Any])?["name"] as? String) ?? ""
+    let tokens = object["tokens"] as? [String: Any]
+    let cache = tokens?["cache"] as? [String: Any]
+    let model = object["model"] as? [String: Any]
+
+    func number(_ value: Any?) -> Int { (value as? NSNumber)?.intValue ?? 0 }
+    let completed = (time?["completed"] as? NSNumber) != nil
+    let header = OpencodeMessageHeader(
+        role: role,
+        completed: completed,
+        aborted: errorName.contains("Abort"),
+        finish: object["finish"] as? String,
+        modelID: model?["id"] as? String,
+        variant: model?["variant"] as? String,
+        contextTokens: number(tokens?["input"]) + number(tokens?["output"])
+            + number(tokens?["reasoning"]) + number(cache?["read"]) + number(cache?["write"])
+    )
+
+    // v2 keeps text inline: typed prompts in `text`, replies as `content` parts
+    let rawText: String?
+    if role == "user" {
+        rawText = object["text"] as? String
+    } else {
+        let parts = object["content"] as? [[String: Any]] ?? []
+        rawText = parts.filter { ($0["type"] as? String) == "text" }
+            .compactMap { $0["text"] as? String }
+            .joined(separator: " ")
+    }
+    return OpencodeV2Message(id: id, header: header, text: condensedText(rawText ?? ""))
 }
 
 private func opencodeColumnString(_ statement: OpaquePointer?, _ index: Int32) -> String? {
@@ -419,8 +979,9 @@ private final class SessionMonitor {
         var meta: SessionMeta
     }
 
-    var onChange: (([ThreadActivity], UsageSnapshot?) -> Void)?
+    var onChange: (([ThreadActivity], UsageSnapshot?, UsageSnapshot?) -> Void)?
     var onCompletion: ((ThreadActivity) -> Void)?
+    var onAsking: ((ThreadActivity) -> Void)?
 
     private let queue = DispatchQueue(label: "app.notchstatus.sessions", qos: .utility)
     private let codexHome: URL
@@ -428,7 +989,10 @@ private final class SessionMonitor {
     private let shellSnapshotsRoot: URL
     private let piHome: URL
     private let piSessionsRoot: URL
-    private let opencodeDatabaseURL: URL
+    private let claudeProjectsRoot: URL
+    private let claudeHome: URL
+    private let opencodeDataDirectory: URL
+    private let opencodeLogURL: URL
     private var streams: [FSEventStreamRef] = []
     private var cursors: [String: Cursor] = [:]
     private var activities: [String: ThreadActivity] = [:]
@@ -442,13 +1006,41 @@ private final class SessionMonitor {
     private var thinkingLevels: [String: String] = [:]
     private var piTotals: [String: PiAccumulator] = [:]
     private var piSessionNames: [String: String] = [:]
+    private var claudeSessions: [String: ClaudeSessionState] = [:]
     private var piContextWindows: [String: Int] = [:]
     private var opencodeLastUpdates: [String: Int64] = [:]
     private var opencodeTitles: [String: String] = [:]
-    private var accountUsage: UsageSnapshot?
-    private var accountUsageUpdatedAt = Date.distantPast
+    private var agentPrompts: [String: AgentPrompt] = [:]
+    private var promptedIDs: Set<String> = []
+    private var opencodeAskingEvents: [OpencodeAskingEvent] = []
+    private var opencodeLogOffset: UInt64 = 0
+    private var opencodeLogLoaded = false
+    private struct PiOpenAsk {
+        let name: String
+        let text: String
+        let permission: Bool
+    }
+    private var piOpenAsks: [String: [String: PiOpenAsk]] = [:]
+    private var codexOpenPrompts: [String: [String: AgentPrompt]] = [:]
+    private var nativeUsage: UsageSnapshot?
+    private var nativeUsageUpdatedAt = Date.distantPast
+    private var remoteRateLimits: RemoteRateLimits?
+    private var accountUsageFetchInFlight = false
+    private var accountUsageFetchAttemptedAt = Date.distantPast
+    private var accountUsageTask: URLSessionDataTask?
+    private var claudeRateLimits: RemoteRateLimits?
+    private var claudeUsageFetchInFlight = false
+    private var claudeUsageNextFetchAt = Date.distantPast
+    private var claudeUsageTask: URLSessionDataTask?
+    private var claudeKeychainAccessRequested = false
+    private let claudeUsageSession = URLSession(configuration: .ephemeral)
     private var expiryWorkItem: DispatchWorkItem?
     private var reconciliationTimer: DispatchSourceTimer?
+    private var generation: UInt = 0
+    private var active = false
+    private let lifecycleLock = NSLock()
+    private var lifecycleGeneration: UInt = 0
+    private var lifecycleActive = false
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
@@ -462,14 +1054,35 @@ private final class SessionMonitor {
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pi/agent")
         piSessionsRoot = piHome.appendingPathComponent("sessions", isDirectory: true)
 
-        let opencodeEnvironmentData = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]
-        let opencodeDataRoot = opencodeEnvironmentData.map { URL(fileURLWithPath: $0).appendingPathComponent("opencode", isDirectory: true) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/opencode", isDirectory: true)
-        opencodeDatabaseURL = opencodeDataRoot.appendingPathComponent("opencode.db")
+        claudeHome = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map(URL.init(fileURLWithPath:))
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+        claudeProjectsRoot = claudeHome.appendingPathComponent("projects", isDirectory: true).resolvingSymlinksInPath()
+
+        let dataHome = ProcessInfo.processInfo.environment["XDG_DATA_HOME"].map(URL.init(fileURLWithPath:))
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share", isDirectory: true)
+        // opencode v1 and v2 share one data directory: official builds write
+        // `opencode.db`, while local/parallel builds (e.g. the `ocfix` alias)
+        // write `opencode-<channel>.db` next to it. legacy sessions live in the
+        // `session`/`message` tables, v2 (the `opencode2` binary) in `session_v2`/`session_message`.
+        opencodeDataDirectory = dataHome.appendingPathComponent("opencode", isDirectory: true)
+        opencodeLogURL = dataHome.appendingPathComponent("opencode", isDirectory: true)
+            .appendingPathComponent("log", isDirectory: true)
+            .appendingPathComponent("opencode.log")
     }
 
     func start() {
+        var startGeneration: UInt = 0
+        queue.sync {
+            generation &+= 1
+            active = true
+            startGeneration = generation
+            lifecycleLock.lock()
+            lifecycleGeneration = generation
+            lifecycleActive = true
+            lifecycleLock.unlock()
+        }
         queue.async { [self] in
+            guard active, generation == startGeneration else { return }
             titles = loadTitles()
             piContextWindows = loadPiContextWindows()
             bootstrap()
@@ -482,9 +1095,21 @@ private final class SessionMonitor {
 
     func stop() {
         queue.sync { [self] in
+            active = false
+            generation &+= 1
+            lifecycleLock.lock()
+            lifecycleGeneration = generation
+            lifecycleActive = false
+            lifecycleLock.unlock()
             expiryWorkItem?.cancel()
             reconciliationTimer?.cancel()
             reconciliationTimer = nil
+            accountUsageTask?.cancel()
+            accountUsageTask = nil
+            accountUsageFetchInFlight = false
+            claudeUsageTask?.cancel()
+            claudeUsageTask = nil
+            claudeUsageFetchInFlight = false
             for stream in streams {
                 FSEventStreamStop(stream)
                 FSEventStreamInvalidate(stream)
@@ -494,15 +1119,16 @@ private final class SessionMonitor {
         }
     }
 
-    func acknowledge(codexSources: Set<String>, piSources: Set<String>, opencodeSources: Set<String>) {
+    func acknowledge(codexSources: Set<String>, piSources: Set<String>, opencodeSources: Set<String>, claudeSources: Set<String> = []) {
         queue.async { [self] in
             var changed = false
             for (key, var activity) in activities where activity.phase == .ready {
                 let sources: Set<String>
                 switch activity.agent {
                 case .pi: sources = piSources
-                case .opencode: sources = opencodeSources
+                case .opencode, .opencode2: sources = opencodeSources
                 case .codex: sources = codexSources
+                case .claude: sources = claudeSources
                 }
                 guard sources.contains(activity.source) else { continue }
                 activity.phase = .seen
@@ -520,7 +1146,7 @@ private final class SessionMonitor {
     }
 
     private func recentSessionPaths() -> [String] {
-        var paths: [String] = codexSessionPaths() + piSessionPaths()
+        var paths: [String] = codexSessionPaths() + piSessionPaths() + claudeSessionPaths()
         paths.removeAll { cursors[$0] != nil }
         return paths
     }
@@ -544,6 +1170,50 @@ private final class SessionMonitor {
             for file in files where file.pathExtension == "jsonl" {
                 paths.append(file.path)
             }
+        }
+        // The VS Code extension resumes long-lived threads whose rollout files
+        // live in old date directories; the codex threads index covers those.
+        paths.append(contentsOf: codexIndexedThreadPaths())
+        return Array(Set(paths))
+    }
+
+    private func codexIndexedThreadPaths() -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: codexHome,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ), let index = files
+            .compactMap({ file -> (Int, URL)? in
+                guard file.lastPathComponent.hasPrefix("state_"), file.pathExtension == "sqlite" else { return nil }
+                let digits = file.deletingPathExtension().lastPathComponent.dropFirst("state_".count)
+                guard let version = Int(digits) else { return nil }
+                return (version, file)
+            })
+            .max(by: { $0.0 < $1.0 })?.1 else { return [] }
+
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(index.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else {
+            if let database { sqlite3_close(database) }
+            return []
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 300)
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        // Two-day cutoff mirrors the date-directory scan above.
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT rollout_path FROM threads WHERE archived = 0 AND updated_at > ?",
+            -1, &statement, nil
+        ) == SQLITE_OK else { return [] }
+        sqlite3_bind_int64(statement, 1, Int64(Date().timeIntervalSince1970 - 2 * 86_400))
+
+        var paths: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let text = sqlite3_column_text(statement, 0) {
+            paths.append(String(cString: text))
         }
         return paths
     }
@@ -589,6 +1259,30 @@ private final class SessionMonitor {
         return prefixes
     }
 
+    private func claudeSessionPaths() -> [String] {
+        let manager = FileManager.default
+        guard let projects = try? manager.contentsOfDirectory(at: claudeProjectsRoot,
+            includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
+        let cutoff = Date().addingTimeInterval(-2 * 86_400)
+        var paths: [String] = []
+        for project in projects where project.hasDirectoryPath {
+            guard let entries = try? manager.contentsOfDirectory(at: project,
+                includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { continue }
+            var files = entries.filter { $0.pathExtension == "jsonl" }
+            for session in entries where session.hasDirectoryPath {
+                let subagents = session.appendingPathComponent("subagents", isDirectory: true)
+                files += (try? manager.contentsOfDirectory(at: subagents,
+                    includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+            }
+            for file in files where file.pathExtension == "jsonl" {
+                guard let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                      modified >= cutoff else { continue }
+                paths.append(file.path)
+            }
+        }
+        return paths
+    }
+
     private func startReconciliationTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
@@ -604,16 +1298,18 @@ private final class SessionMonitor {
         }
         changed = reconcileOpencode() || changed
         changed = stopOrphanedTurns() || changed
+        refreshCodexAccountUsageIfNeeded()
+        refreshClaudeAccountUsageIfNeeded()
         if changed { publish() }
     }
 
     private func stopOrphanedTurns() -> Bool {
         let now = Date()
         var changed = false
-        // ponytail: silence-based crash fallbacks; codex allows six hours, pi and
-        // opencode thirty minutes because both stream turns as discrete events.
+        // shortcut: silence detects abandoned turns; use process liveness if long silent work is common.
         for (key, var activity) in activities
-        where shouldMarkStopped(activity.phase, updatedAt: activity.updatedAt, timeout: activity.runningTimeout, now: now) {
+        where activity.prompt == nil
+            && shouldMarkStopped(activity.phase, updatedAt: activity.updatedAt, timeout: activity.runningTimeout, now: now) {
             activity.phase = .stopped
             activity.updatedAt = now
             activities[key] = activity
@@ -624,7 +1320,7 @@ private final class SessionMonitor {
 
     // MARK: - opencode reconcile
 
-    private struct OpencodeSessionRow {
+private struct OpencodeSessionRow {
         let id: String
         let parentID: String?
         let title: String
@@ -632,33 +1328,103 @@ private final class SessionMonitor {
         let agentName: String
         let modelJSON: String?
         let cost: Double
-        let totalTokens: Int
-        let updatedAt: Date
+    let totalTokens: Int
+    let updatedAt: Date
+    let activityMarker: Int64
+}
+
+    private enum OpencodeSchema {
+        case v1
+        case v2
+    }
+
+    // Resolved on every pass so databases created after launch (e.g. by
+    // starting `ocfix` later) are picked up without a restart.
+    private var opencodeStores: [OpencodeStore] {
+        let fallback = opencodeDataDirectory.appendingPathComponent("opencode.db")
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: opencodeDataDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [OpencodeStore(databaseURL: fallback)] }
+        let matches = files.filter {
+            $0.pathExtension == "db"
+                && ($0.lastPathComponent == "opencode.db" || $0.lastPathComponent.hasPrefix("opencode-"))
+        }.sorted {
+            if $0.lastPathComponent == "opencode.db" { return true }
+            if $1.lastPathComponent == "opencode.db" { return false }
+            return $0.lastPathComponent < $1.lastPathComponent
+        }
+        return matches.isEmpty ? [OpencodeStore(databaseURL: fallback)] : matches.map { OpencodeStore(databaseURL: $0) }
     }
 
     private func reconcileOpencode() -> Bool {
-        guard FileManager.default.fileExists(atPath: opencodeDatabaseURL.path) else { return false }
-        return withOpencodeDatabase { database in readOpencodeSessions(database) } ?? false
+        tailOpencodeLog()
+        return opencodeStores.reduce(false) { changed, store in
+            guard FileManager.default.fileExists(atPath: store.databaseURL.path) else { return changed }
+            return (withOpencodeDatabase(store) { database in
+                let legacyChanged = readOpencodeSessions(database, agent: .opencode, table: "session", schema: .v1)
+                let v2Changed = readOpencodeSessions(database, agent: .opencode2, table: "session_v2", schema: .v2)
+                let promptChanged = refreshOpencodePrompts(database)
+                return legacyChanged || v2Changed || promptChanged
+            } ?? false) || changed
+        }
     }
 
-    private func withOpencodeDatabase<T>(_ body: (OpaquePointer) -> T?) -> T? {
+    private func tailOpencodeLog() {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: opencodeLogURL.path),
+              let size = (attributes[.size] as? NSNumber)?.uint64Value, size > 0 else { return }
+        if !opencodeLogLoaded {
+            opencodeLogOffset = size > 131_072 ? size - 131_072 : 0
+            opencodeLogLoaded = true
+        } else if size < opencodeLogOffset {
+            opencodeLogOffset = 0
+        }
+        guard size > opencodeLogOffset,
+              let handle = try? FileHandle(forReadingFrom: opencodeLogURL) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seek(toOffset: opencodeLogOffset)
+            guard let appended = try handle.readToEnd() else { return }
+            opencodeLogOffset = size
+            for chunk in appended.split(separator: 0x0A) {
+                if let event = parseOpencodeAskingLine(String(decoding: chunk, as: UTF8.self)) {
+                    opencodeAskingEvents.append(event)
+                }
+            }
+            if opencodeAskingEvents.count > 64 {
+                opencodeAskingEvents.removeFirst(opencodeAskingEvents.count - 64)
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func withOpencodeDatabase<T>(_ store: OpencodeStore, _ body: (OpaquePointer) -> T?) -> T? {
         var database: OpaquePointer?
-        guard sqlite3_open_v2(opencodeDatabaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
-              let database else { return nil }
+        let result = sqlite3_open_v2(store.databaseURL.path, &database, SQLITE_OPEN_READONLY, nil)
+        guard result == SQLITE_OK else {
+            if let database { sqlite3_close(database) }
+            return nil
+        }
+        guard let database else { return nil }
         defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, 300)
         return body(database)
     }
 
-    private func readOpencodeSessions(_ database: OpaquePointer) -> Bool {
+    private func readOpencodeSessions(_ database: OpaquePointer, agent: AgentKind, table: String, schema: OpencodeSchema) -> Bool {
         let cutoff = Int64(
             (Date().timeIntervalSince1970 - (opencodeRunningInactivityTimeout + 5 * 60)) * 1000
         )
+        let activityMarker: String = schema == .v1
+            ? "MAX(time_updated, COALESCE((SELECT MAX(time_updated) FROM message WHERE session_id = \(table).id), 0))"
+            : "MAX(time_updated, COALESCE((SELECT MAX(time_updated) FROM session_message WHERE session_id = \(table).id), 0), COALESCE((SELECT MAX(seq) FROM session_message WHERE session_id = \(table).id), 0))"
         let sql = """
         SELECT id, parent_id, title, directory, agent, model, cost,
                tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-               time_updated
-        FROM session
+               time_updated, \(activityMarker)
+        FROM \(table)
         WHERE time_archived IS NULL AND time_updated > ?1
         ORDER BY time_updated DESC
         LIMIT 12
@@ -672,8 +1438,10 @@ private final class SessionMonitor {
         while sqlite3_step(statement) == SQLITE_ROW {
             guard let id = opencodeColumnString(statement, 0) else { continue }
             let updatedAtMs = sqlite3_column_int64(statement, 12)
-            guard opencodeLastUpdates[id] != updatedAtMs else { continue }
-            opencodeLastUpdates[id] = updatedAtMs
+            let activityMarker = sqlite3_column_int64(statement, 13)
+            let key = "\(agent.label):\(id)"
+            guard opencodeLastUpdates[key] != activityMarker else { continue }
+            opencodeLastUpdates[key] = activityMarker
 
             let totalTokens = (7...11).reduce(Int(0)) { $0 + Int(sqlite3_column_int64(statement, $1)) }
             let row = OpencodeSessionRow(
@@ -685,32 +1453,44 @@ private final class SessionMonitor {
                 modelJSON: opencodeColumnString(statement, 5),
                 cost: sqlite3_column_double(statement, 6),
                 totalTokens: totalTokens,
-                updatedAt: Date(timeIntervalSince1970: Double(updatedAtMs) / 1000)
+                updatedAt: Date(timeIntervalSince1970: Double(updatedAtMs) / 1000),
+                activityMarker: activityMarker
             )
-            changed = applyOpencodeSession(row, database: database) || changed
+            changed = applyOpencodeSession(row, database: database, agent: agent, schema: schema) || changed
         }
         return changed
     }
 
-    private func applyOpencodeSession(_ row: OpencodeSessionRow, database: OpaquePointer) -> Bool {
-        let messages = opencodeRecentMessages(database, sessionID: row.id)
+    private func applyOpencodeSession(
+        _ row: OpencodeSessionRow,
+        database: OpaquePointer,
+        agent: AgentKind,
+        schema: OpencodeSchema
+    ) -> Bool {
+        let messages: [(id: String, header: OpencodeMessageHeader, text: String?)] = schema == .v1
+            ? opencodeRecentMessages(database, sessionID: row.id).map { ($0.id, $0.header, nil) }
+            : opencodeRecentMessagesV2(database, sessionID: row.id)
         guard let event = opencodeTurnEvent(messages.first?.header) else { return false }
+
+        func messageText(_ message: (id: String, header: OpencodeMessageHeader, text: String?)) -> String? {
+            schema == .v1 ? opencodeTextParts(database, messageID: message.id) : message.text
+        }
 
         var prompt: String?
         var response: String?
         var model: String?
         var contextTokens = 0
         if let userIndex = messages.firstIndex(where: { $0.header.role == "user" }) {
-            prompt = opencodeTextParts(database, messageID: messages[userIndex].id)
+            prompt = messageText(messages[userIndex])
             for message in messages[..<userIndex] {
                 if model == nil { model = opencodeModelLabel(modelID: message.header.modelID, variant: message.header.variant) }
                 if contextTokens == 0 { contextTokens = message.header.contextTokens }
-                if response == nil { response = opencodeTextParts(database, messageID: message.id) }
+                if response == nil { response = messageText(message) }
             }
         }
         if model == nil, let modelJSON = row.modelJSON { model = opencodeSessionModel(modelJSON) }
 
-        let key = "opencode:\(row.id)"
+        let key = "\(agent.label):\(row.id)"
         var phase: ThreadPhase
         switch event {
         case .started: phase = .running
@@ -718,6 +1498,7 @@ private final class SessionMonitor {
         case .cancelled: phase = .stopped
         }
         if phase == .running,
+           agentPrompts[key] == nil,
            shouldMarkStopped(.running, updatedAt: row.updatedAt, timeout: opencodeRunningInactivityTimeout) {
             phase = .stopped
         }
@@ -726,7 +1507,7 @@ private final class SessionMonitor {
 
         let meta = SessionMeta(
             id: row.id,
-            agent: .opencode,
+            agent: agent,
             parentID: row.parentID,
             nickname: row.agentName == "build" ? nil : row.agentName,
             source: "cli",
@@ -735,8 +1516,10 @@ private final class SessionMonitor {
 
         if previousPhase == .running, phase == .ready, meta.parentID == nil {
             let completed = activity(for: meta, phase: .ready, at: row.updatedAt)
-            DispatchQueue.main.async { [weak self] in self?.onCompletion?(completed) }
+            dispatchCompletion(completed)
         }
+
+        if phase != .running { agentPrompts.removeValue(forKey: key) }
 
         if prompt == nil { prompts.removeValue(forKey: key) } else { prompts[key] = prompt }
         if response == nil { responses.removeValue(forKey: key) } else { responses[key] = response }
@@ -753,7 +1536,7 @@ private final class SessionMonitor {
         } else {
             usages.removeValue(forKey: key)
         }
-        if !row.title.isEmpty { opencodeTitles[key] = row.title }
+        if !row.title.isEmpty, !isOpencodeDefaultTitle(row.title) { opencodeTitles[key] = row.title }
 
         guard shouldRetain(phase, updatedAt: row.updatedAt) else {
             return activities.removeValue(forKey: key) != nil
@@ -782,6 +1565,27 @@ private final class SessionMonitor {
         return messages
     }
 
+    private func opencodeRecentMessagesV2(
+        _ database: OpaquePointer,
+        sessionID: String
+    ) -> [(id: String, header: OpencodeMessageHeader, text: String?)] {
+        let sql = "SELECT id, type, data FROM session_message WHERE session_id = ?1 AND type IN ('user','assistant') ORDER BY seq DESC LIMIT 8"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, sqliteTransient)
+
+        var messages: [(id: String, header: OpencodeMessageHeader, text: String?)] = []
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let id = opencodeColumnString(statement, 0),
+              let type = opencodeColumnString(statement, 1),
+              let data = opencodeColumnString(statement, 2),
+              let message = parseOpencodeV2Message(id: id, role: type, data: Data(data.utf8)) {
+            messages.append((message.id, message.header, message.text))
+        }
+        return messages
+    }
+
     private func opencodeTextParts(_ database: OpaquePointer, messageID: String) -> String? {
         let sql = "SELECT substr(data,1,65536) FROM part WHERE message_id = ?1 ORDER BY rowid"
         var statement: OpaquePointer?
@@ -800,8 +1604,144 @@ private final class SessionMonitor {
         return condensedText(fragments.joined(separator: " "))
     }
 
+    // MARK: - agent prompt detection
+
+    // Question and permission waits do not bump session.time_updated, so the
+    // change-gated read above can stay quiet while an agent is parked on the
+    // user. Refresh prompt state for running sessions every reconcile instead.
+    private func refreshOpencodePrompts(_ database: OpaquePointer) -> Bool {
+        var changed = false
+        let now = Date()
+        for (key, activity) in activities
+        where activity.phase == .running && (activity.agent == .opencode || activity.agent == .opencode2) {
+            if let native = opencodeNativePending(database, sessionID: activity.id) {
+                let key = activity.key
+                guard agentPrompts[key] != native else { continue }
+                agentPrompts[key] = native
+                var updated = activity
+                updated.prompt = native
+                activities[key] = updated
+                changed = true
+                if !promptedIDs.contains(native.callID) {
+                    promptedIDs.insert(native.callID)
+                    dispatchAsking(updated)
+                }
+                continue
+            }
+            let observations: [OpencodeToolObservation]
+            if activity.agent == .opencode {
+                guard let messageID = opencodeNewestAssistantMessageID(database, sessionID: activity.id) else { continue }
+                observations = opencodeToolObservationsV1(database, messageID: messageID)
+            } else {
+                observations = opencodeToolObservationsV2(database, sessionID: activity.id)
+            }
+            let prompt = opencodePrompt(from: observations, askingEvents: opencodeAskingEvents, now: now)
+            guard agentPrompts[key] != prompt else { continue }
+            agentPrompts[key] = prompt
+            var updated = activity
+            updated.prompt = prompt
+            activities[key] = updated
+            changed = true
+            if let prompt, !promptedIDs.contains(prompt.callID) {
+                promptedIDs.insert(prompt.callID)
+                dispatchAsking(updated)
+            }
+        }
+        let liveIDs = Set(agentPrompts.values.map(\.callID))
+        promptedIDs.formIntersection(liveIDs)
+        return changed
+    }
+
+    private func opencodeNativePending(_ database: OpaquePointer, sessionID: String) -> AgentPrompt? {
+        let sql = "SELECT id, type, data FROM session_pending WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 8"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, sqliteTransient)
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let id = opencodeColumnString(statement, 0),
+              let type = opencodeColumnString(statement, 1) {
+            if let prompt = parseOpencodePending(id: id, type: type, data: opencodeColumnString(statement, 2)) { return prompt }
+        }
+        return nil
+    }
+
+    private func opencodeNewestAssistantMessageID(_ database: OpaquePointer, sessionID: String) -> String? {
+        let sql = "SELECT id, substr(data,1,65536) FROM message WHERE session_id = ?1 ORDER BY time_created DESC, rowid DESC LIMIT 8"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, sqliteTransient)
+
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let id = opencodeColumnString(statement, 0) {
+            let data = opencodeColumnString(statement, 1) ?? ""
+            if parseOpencodeMessageHeader(Data(data.utf8))?.role == "assistant" { return id }
+        }
+        return nil
+    }
+
+    private func opencodeToolObservationsV1(_ database: OpaquePointer, messageID: String) -> [OpencodeToolObservation] {
+        let sql = "SELECT substr(data,1,65536), time_created FROM part WHERE message_id = ?1 ORDER BY rowid"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, messageID, -1, sqliteTransient)
+
+        var observations: [OpencodeToolObservation] = []
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let data = opencodeColumnString(statement, 0),
+              let object = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any],
+              (object["type"] as? String) == "tool" {
+            let state = object["state"] as? [String: Any] ?? [:]
+            observations.append(OpencodeToolObservation(
+                callID: object["callID"] as? String ?? "",
+                name: object["tool"] as? String ?? "",
+                status: state["status"] as? String ?? "",
+                input: state["input"] as? [String: Any] ?? [:],
+                progressed: state["metadata"] != nil || state["title"] != nil,
+                createdAt: Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 1)) / 1000)
+            ))
+        }
+        return observations
+    }
+
+    private func opencodeToolObservationsV2(_ database: OpaquePointer, sessionID: String) -> [OpencodeToolObservation] {
+        let sql = "SELECT substr(data,1,262144), time_created FROM session_message WHERE session_id = ?1 AND type = 'assistant' ORDER BY seq DESC LIMIT 3"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, sqliteTransient)
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let rowTime = Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 1)) / 1000)
+            guard let data = opencodeColumnString(statement, 0),
+                  let object = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any],
+                  let content = object["content"] as? [[String: Any]] else { continue }
+
+            let tools = content.filter { ($0["type"] as? String) == "tool" }
+            guard !tools.isEmpty else { continue }
+            return tools.map { item in
+                let state = item["state"] as? [String: Any] ?? [:]
+                let time = item["time"] as? [String: Any] ?? [:]
+                let contentText = ((state["content"] as? [[String: Any]]) ?? [])
+                    .compactMap { $0["text"] as? String }
+                    .contains { !$0.isEmpty }
+                return OpencodeToolObservation(
+                    callID: item["id"] as? String ?? "",
+                    name: item["name"] as? String ?? item["tool"] as? String ?? "",
+                    status: state["status"] as? String ?? "",
+                    input: state["input"] as? [String: Any] ?? [:],
+                    progressed: contentText || ((state["structured"] as? [String: Any])?.isEmpty == false),
+                    createdAt: (time["created"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } ?? rowTime
+                )
+            }
+        }
+        return []
+    }
+
     private func startEventStreams() {
-        for root in [sessionsRoot, piSessionsRoot]
+        for root in [sessionsRoot, piSessionsRoot, claudeProjectsRoot]
         where FileManager.default.fileExists(atPath: root.path) {
             startEventStream(forRoot: root)
         }
@@ -867,6 +1807,16 @@ private final class SessionMonitor {
               let fileSize = values.fileSize else { return false }
 
         if meta.agent == .codex { meta.source = currentSource(for: meta) }
+        if meta.agent == .claude {
+            claudeSessions[meta.key] = ClaudeSessionState()
+            cursors[path] = Cursor(offset: 0, meta: meta)
+            let changed = readAppendedEvents(from: path, notify: false)
+            if let activity = activities[meta.key], let prompt = activity.prompt {
+                let id = "\(meta.key):\(prompt.callID)"
+                if promptedIDs.insert(id).inserted { dispatchAsking(activity) }
+            }
+            return changed
+        }
         cursors[path] = Cursor(offset: UInt64(fileSize), meta: meta)
 
         let key = meta.key
@@ -875,6 +1825,7 @@ private final class SessionMonitor {
 
         if meta.agent == .pi {
             guard let piSnapshot = latestPiSnapshot(at: path) else { return false }
+            replayPiAsks(at: path, for: meta)
             if let base = piSnapshot.baseModel { piBaseModels[key] = base }
             if let provider = piSnapshot.provider { piProviders[key] = provider }
             if let thinking = piSnapshot.thinking { thinkingLevels[key] = thinking }
@@ -898,6 +1849,7 @@ private final class SessionMonitor {
                 name: piSnapshot.name
             )
         } else {
+            replayCodexPrompts(at: path, for: meta)
             snapshot = latestCodexSnapshot(at: path)
         }
 
@@ -906,9 +1858,9 @@ private final class SessionMonitor {
         if let prompt = snapshot.prompt { prompts[key] = prompt }
         if let model = snapshot.model { models[key] = model }
         if let usage = snapshot.usage { usages[key] = usage }
-        if meta.agent == .codex, let usage = snapshot.usage, modifiedAt > accountUsageUpdatedAt {
-            accountUsage = usage
-            accountUsageUpdatedAt = modifiedAt
+        if meta.agent == .codex, let usage = snapshot.usage, modifiedAt > nativeUsageUpdatedAt {
+            nativeUsage = usage
+            nativeUsageUpdatedAt = modifiedAt
         }
         let phase: ThreadPhase
         switch snapshot.event {
@@ -919,10 +1871,14 @@ private final class SessionMonitor {
         guard shouldRetain(phase, updatedAt: modifiedAt) else { return false }
 
         activities[key] = activity(for: meta, phase: phase, at: modifiedAt)
+        if let prompt = agentPrompts[key], !promptedIDs.contains(prompt.callID) {
+            promptedIDs.insert(prompt.callID)
+            dispatchAsking(activities[key]!)
+        }
         return true
     }
 
-    private func readAppendedEvents(from path: String) -> Bool {
+    private func readAppendedEvents(from path: String, notify: Bool = true) -> Bool {
         guard var cursor = cursors[path],
               let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let size = (attributes[.size] as? NSNumber)?.uint64Value else { return false }
@@ -948,9 +1904,35 @@ private final class SessionMonitor {
 
             for part in parts.prefix(completeCount) {
                 let line = Data(part)
+                if cursor.meta.agent == .claude {
+                    changed = applyClaudeLine(line, for: &cursor.meta, notify: notify) || changed
+                    continue
+                }
                 if cursor.meta.agent == .pi {
                     changed = applyPiEvent(parsePiEvent(line), for: cursor.meta) || changed
+                    let calls = parsePiToolCalls(line)
+                    let resolved = parsePiToolResultID(line)
+                    if calls != nil || resolved != nil {
+                        changed = applyPiToolEvent(calls: calls, resolved: resolved, for: cursor.meta) || changed
+                    }
                     continue
+                }
+                if cursor.meta.agent == .codex {
+                    let key = cursor.meta.key
+                    if let pending = parseCodexPendingPrompt(line) {
+                        codexOpenPrompts[key, default: [:]][pending.callID] = pending
+                        agentPrompts[key] = pending
+                        changed = refreshActivity(for: cursor.meta) || changed
+                        if let activity = activities[key], !promptedIDs.contains(pending.callID) {
+                            promptedIDs.insert(pending.callID)
+                            dispatchAsking(activity)
+                        }
+                    } else if let resolved = parseCodexResolvedCallID(line) {
+                        codexOpenPrompts[key]?.removeValue(forKey: resolved)
+                        let prompt = codexOpenPrompts[key]?.values.sorted { $0.callID < $1.callID }.first
+                        agentPrompts[key] = prompt
+                        changed = refreshActivity(for: cursor.meta) || changed
+                    }
                 }
                 if let prompt = parsePrompt(line) {
                     prompts[cursor.meta.key] = prompt
@@ -969,8 +1951,8 @@ private final class SessionMonitor {
                 }
                 if let usage = parseUsage(line) {
                     usages[cursor.meta.key] = usage
-                    accountUsage = usage
-                    accountUsageUpdatedAt = Date()
+                    nativeUsage = usage
+                    nativeUsageUpdatedAt = Date()
                     _ = refreshActivity(for: cursor.meta)
                     changed = true
                     continue
@@ -984,14 +1966,20 @@ private final class SessionMonitor {
                     prompts.removeValue(forKey: cursor.meta.key)
                     models.removeValue(forKey: cursor.meta.key)
                     usages.removeValue(forKey: cursor.meta.key)
+                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                    agentPrompts.removeValue(forKey: cursor.meta.key)
                     activities[cursor.meta.key] = activity(for: cursor.meta, phase: .running, at: Date())
                 case .completed:
+                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                    agentPrompts.removeValue(forKey: cursor.meta.key)
                     let completed = activity(for: cursor.meta, phase: .ready, at: Date())
                     if activities[cursor.meta.key]?.phase == .running, cursor.meta.parentID == nil {
-                        DispatchQueue.main.async { [weak self] in self?.onCompletion?(completed) }
+                        dispatchCompletion(completed)
                     }
                     activities[cursor.meta.key] = completed
                 case .cancelled:
+                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                    agentPrompts.removeValue(forKey: cursor.meta.key)
                     activities[cursor.meta.key] = activity(for: cursor.meta, phase: .stopped, at: Date())
                 }
                 changed = true
@@ -1005,15 +1993,59 @@ private final class SessionMonitor {
         }
     }
 
+    private func applyClaudeLine(_ line: Data, for meta: inout SessionMeta, notify: Bool) -> Bool {
+        let key = meta.key
+        let previousEvent = claudeSessions[key]?.event
+        let previousDate = claudeSessions[key]?.updatedAt
+        guard claudeSessions[key, default: ClaudeSessionState()].consume(line),
+              let state = claudeSessions[key] else { return false }
+        if let source = state.source { meta.source = source }
+        guard let event = state.event, let date = state.updatedAt else { return false }
+        prompts[key] = state.prompt
+        responses[key] = state.response
+        models[key] = state.model
+        usages[key] = state.usage
+        agentPrompts[key] = state.pending.values.sorted { $0.callID < $1.callID }.first
+
+        let previous = activities[key]
+        let phase: ThreadPhase
+        if let previous, previousEvent == event,
+           previousDate == date || (previous.phase == .seen && event == .completed) {
+            phase = previous.phase
+        } else {
+            switch event {
+            case .started: phase = .running
+            case .completed: phase = .ready
+            case .cancelled: phase = .stopped
+            }
+        }
+        guard shouldRetain(phase, updatedAt: date) else {
+            return activities.removeValue(forKey: key) != nil
+        }
+        let updated = activity(for: meta, phase: phase, at: date)
+        activities[key] = updated
+        if notify {
+            if previous?.phase == .running, phase == .ready, meta.parentID == nil {
+                dispatchCompletion(updated)
+            }
+            if let prompt = updated.prompt, promptedIDs.insert("\(key):\(prompt.callID)").inserted {
+                dispatchAsking(updated)
+            }
+        }
+        return previous != updated
+    }
+
     @discardableResult
     private func applyPiEvent(_ event: PiEvent?, for meta: SessionMeta) -> Bool {
         guard let event else { return false }
         let key = meta.key
 
-        switch event {
+    switch event {
         case .userPrompt(let prompt):
             titles = loadTitles()
             piContextWindows = loadPiContextWindows()
+            piOpenAsks.removeValue(forKey: key)
+            agentPrompts.removeValue(forKey: key)
             prompts[key] = prompt
             responses.removeValue(forKey: key)
             activities[key] = activity(for: meta, phase: .running, at: Date())
@@ -1032,12 +2064,16 @@ private final class SessionMonitor {
             }
             switch stopReason {
             case "stop", "length":
+                piOpenAsks.removeValue(forKey: key)
+                agentPrompts.removeValue(forKey: key)
                 let completed = activity(for: meta, phase: .ready, at: Date())
                 if activities[key]?.phase == .running {
-                    DispatchQueue.main.async { [weak self] in self?.onCompletion?(completed) }
+                    dispatchCompletion(completed)
                 }
                 activities[key] = completed
             case "aborted", "error":
+                piOpenAsks.removeValue(forKey: key)
+                agentPrompts.removeValue(forKey: key)
                 activities[key] = activity(for: meta, phase: .stopped, at: Date())
             default:
                 _ = refreshActivity(for: meta)
@@ -1082,6 +2118,87 @@ private final class SessionMonitor {
         guard let current = activities[meta.key] else { return false }
         activities[meta.key] = activity(for: meta, phase: current.phase, at: Date())
         return true
+    }
+
+    // MARK: - pi ask tracking
+
+    @discardableResult
+    private func applyPiToolEvent(
+         calls: [(id: String, name: String, text: String, permission: Bool)]?,
+        resolved: String?,
+        for meta: SessionMeta
+    ) -> Bool {
+        let key = meta.key
+        var changed = false
+
+        for call in calls ?? [] {
+            guard isAskToolName(call.name) else { continue }
+            if piOpenAsks[key]?[call.id] == nil {
+            piOpenAsks[key, default: [:]][call.id] = PiOpenAsk(name: call.name, text: call.text, permission: call.permission)
+                changed = true
+            }
+        }
+        if let resolved, piOpenAsks[key]?.removeValue(forKey: resolved) != nil {
+            changed = true
+        }
+        guard changed else { return false }
+        updatePiPrompt(for: meta)
+        return true
+    }
+
+    private func replayPiAsks(at path: String, for meta: SessionMeta) {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
+        defer { try? handle.close() }
+
+        let size = (try? handle.seekToEnd()) ?? 0
+        let cap: UInt64 = 8 * 1024 * 1024
+        guard size > 0,
+              (try? handle.seek(toOffset: size > cap ? size - cap : 0)) != nil,
+              let data = try? handle.read(upToCount: Int(min(size, cap))) else { return }
+
+        for chunk in data.split(separator: 0x0A) {
+            let line = Data(chunk)
+            _ = applyPiToolEvent(calls: parsePiToolCalls(line), resolved: parsePiToolResultID(line), for: meta)
+        }
+        updatePiPrompt(for: meta)
+    }
+
+    private func updatePiPrompt(for meta: SessionMeta) {
+        let key = meta.key
+        let prompt = (piOpenAsks[key] ?? [:])
+            .sorted { $0.key < $1.key }
+            .first
+            .map { AgentPrompt(kind: $0.value.permission ? .permission : .question, tool: $0.value.name, text: $0.value.text, callID: $0.key) }
+        guard agentPrompts[key] != prompt, let current = activities[key] else {
+            agentPrompts[key] = prompt
+            return
+        }
+        agentPrompts[key] = prompt
+        var updated = current
+        updated.prompt = prompt
+        activities[key] = updated
+        if let prompt, !promptedIDs.contains(prompt.callID) {
+            promptedIDs.insert(prompt.callID)
+            dispatchAsking(updated)
+        }
+    }
+
+    private func replayCodexPrompts(at path: String, for meta: SessionMeta) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+        let key = meta.key
+        codexOpenPrompts.removeValue(forKey: key)
+        for line in data.split(separator: 0x0A) {
+            let item = Data(line)
+            if let pending = parseCodexPendingPrompt(item) {
+                codexOpenPrompts[key, default: [:]][pending.callID] = pending
+            } else if let resolved = parseCodexResolvedCallID(item) {
+                codexOpenPrompts[key]?.removeValue(forKey: resolved)
+            } else if parseTurnEvent(item) != nil {
+                // A turn boundary resolves protocol items that did not emit a result.
+                codexOpenPrompts.removeValue(forKey: key)
+            }
+        }
+        agentPrompts[key] = codexOpenPrompts[key]?.values.sorted { $0.callID < $1.callID }.first
     }
 
     private func latestCodexSnapshot(at path: String) -> SessionSnapshot? {
@@ -1206,8 +2323,26 @@ private final class SessionMonitor {
         guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
         defer { try? handle.close() }
 
-        guard let prefix = try? handle.read(upToCount: 1_048_576),
-              let firstLine = prefix.split(separator: 0x0A, maxSplits: 1).first,
+        guard let prefix = try? handle.read(upToCount: 1_048_576) else { return nil }
+        if URL(fileURLWithPath: path).resolvingSymlinksInPath().path.hasPrefix(claudeProjectsRoot.path + "/") {
+            // Metadata records can precede the first conversation message.
+            for line in prefix.split(separator: 0x0A) {
+                guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                      let sessionID = object["sessionId"] as? String,
+                      let cwd = object["cwd"] as? String else { continue }
+                let file = URL(fileURLWithPath: path)
+                let isChild = file.deletingLastPathComponent().lastPathComponent == "subagents"
+                    || object["isSidechain"] as? Bool == true
+                let agentID = object["agentId"] as? String
+                    ?? file.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "agent-", with: "")
+                return SessionMeta(id: isChild ? "\(sessionID):agent:\(agentID)" : sessionID, agent: .claude,
+                    parentID: isChild ? sessionID : nil, nickname: isChild ? agentID : nil,
+                    source: claudeSource(object["entrypoint"] as? String ?? "cli"),
+                    project: URL(fileURLWithPath: cwd).lastPathComponent)
+            }
+            return nil
+        }
+        guard let firstLine = prefix.split(separator: 0x0A, maxSplits: 1).first,
               let object = try? JSONSerialization.jsonObject(with: Data(firstLine)) as? [String: Any],
               let type = object["type"] as? String else { return nil }
 
@@ -1303,9 +2438,9 @@ private final class SessionMonitor {
             agent: meta.agent,
             parentID: meta.parentID,
             nickname: meta.nickname,
-            title: (meta.agent == .opencode
+            title: (meta.agent == .opencode || meta.agent == .opencode2
                 ? opencodeTitles[meta.key] ?? prompts[meta.key]
-                : prompts[meta.key]
+                : (meta.agent == .claude ? claudeSessions[meta.key]?.name : nil) ?? prompts[meta.key]
                     ?? (meta.agent == .pi ? piSessionNames[meta.key] : titles[meta.key]))
                 ?? (meta.project.isEmpty ? "\(meta.agent.displayName) thread" : meta.project),
             detail: responses[meta.key] ?? "",
@@ -1314,8 +2449,108 @@ private final class SessionMonitor {
             model: models[meta.key] ?? "",
             usage: usages[meta.key],
             phase: phase,
-            updatedAt: date
+            updatedAt: date,
+            prompt: agentPrompts[meta.key]
         )
+    }
+
+    private func refreshCodexAccountUsageIfNeeded() {
+        // Account limits are account-wide and must not depend on a retained
+        // Codex session. Pi and OpenCode can consume the same Codex account.
+        guard !accountUsageFetchInFlight,
+        Date().timeIntervalSince(accountUsageFetchAttemptedAt) >= 60 else { return }
+        let authURL = codexHome.appendingPathComponent("auth.json")
+        guard let data = try? Data(contentsOf: authURL),
+              let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let accessToken = tokens["access_token"] as? String,
+              !accessToken.isEmpty else { return }
+
+        var request = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if let accountID = tokens["account_id"] as? String, !accountID.isEmpty {
+            request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        accountUsageFetchInFlight = true
+        accountUsageFetchAttemptedAt = Date()
+        let callbackGeneration = generation
+        accountUsageTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self, let data,
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let parsed = parseCodexUsageResponse(data) else {
+                self?.queue.async { [weak self] in
+                    guard let self, self.active, self.generation == callbackGeneration else { return }
+                    self.accountUsageFetchInFlight = false
+                    self.accountUsageTask = nil
+                }
+                return
+            }
+            self.queue.async { [weak self] in
+                guard let self else { return }
+                guard self.active, self.generation == callbackGeneration else { return }
+                self.accountUsageFetchInFlight = false
+                self.accountUsageTask = nil
+                guard parsed.primary != nil || parsed.secondary != nil else { return }
+                let current = self.remoteRateLimits
+                self.remoteRateLimits = RemoteRateLimits(
+                    primary: parsed.primary ?? current?.primary,
+                    secondary: parsed.secondary ?? current?.secondary
+                )
+                self.publish()
+            }
+        }
+        accountUsageTask?.resume()
+    }
+
+    private func refreshClaudeAccountUsageIfNeeded() {
+        guard !claudeUsageFetchInFlight, Date() >= claudeUsageNextFetchAt else { return }
+        claudeUsageFetchInFlight = true
+        claudeUsageNextFetchAt = Date().addingTimeInterval(60)
+        let callbackGeneration = generation
+        let allowInteraction = !claudeKeychainAccessRequested
+        claudeKeychainAccessRequested = true
+        let home = claudeHome
+        // A Keychain approval must not block the session watcher or app shutdown.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let token = loadClaudeAccessToken(home: home, allowInteraction: allowInteraction)
+            self?.queue.async { [weak self] in
+                guard let self, self.active, self.generation == callbackGeneration else { return }
+                guard let token else {
+                    self.claudeUsageFetchInFlight = false
+                    if self.claudeRateLimits != nil {
+                        self.claudeRateLimits = nil
+                        self.publish()
+                    }
+                    return
+                }
+                var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+                request.httpMethod = "GET"
+                request.timeoutInterval = 20
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+                request.setValue("application/json", forHTTPHeaderField: "Accept")
+                self.claudeUsageTask = self.claudeUsageSession.dataTask(with: request) { [weak self] data, response, _ in
+                    self?.queue.async { [weak self] in
+                        guard let self, self.active, self.generation == callbackGeneration else { return }
+                        self.claudeUsageFetchInFlight = false
+                        self.claudeUsageTask = nil
+                        let http = response as? HTTPURLResponse
+                        if http?.statusCode == 429 {
+                            let delay = http?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 300
+                            self.claudeUsageNextFetchAt = Date().addingTimeInterval(delay.isFinite ? max(60, delay) : 300)
+                        }
+                        let parsed = http?.statusCode == 200 ? data.flatMap(parseClaudeUsageResponse) : nil
+                        if self.claudeRateLimits != parsed {
+                            self.claudeRateLimits = parsed
+                            self.publish()
+                        }
+                    }
+                }
+                self.claudeUsageTask?.resume()
+            }
+        }
     }
 
     private func sourceLabel(_ source: String, originator: String) -> String {
@@ -1335,15 +2570,51 @@ private final class SessionMonitor {
     private func publish() {
         let now = Date()
         activities = activities.filter { shouldRetain($0.value.phase, updatedAt: $0.value.updatedAt, now: now) }
+        let liveKeys = Set(activities.keys)
+        agentPrompts = agentPrompts.filter { liveKeys.contains($0.key) }
+        piOpenAsks = piOpenAsks.filter { liveKeys.contains($0.key) }
+        refreshCodexAccountUsageIfNeeded()
+        refreshClaudeAccountUsageIfNeeded()
         scheduleExpiry()
         let snapshot = activities.values.sorted {
+            if ($0.prompt != nil) != ($1.prompt != nil) {
+                return $0.prompt != nil
+            }
             if phaseRank($0.phase) != phaseRank($1.phase) {
                 return phaseRank($0.phase) < phaseRank($1.phase)
             }
             return $0.updatedAt > $1.updatedAt
         }
-        let usage = accountUsage
-        DispatchQueue.main.async { [weak self] in self?.onChange?(snapshot, usage) }
+        let usage = effectiveUsage(local: nativeUsage, remote: remoteRateLimits)
+        let claudeUsage = effectiveUsage(local: nil, remote: claudeRateLimits)
+        let callbackGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
+            self.onChange?(snapshot, usage, claudeUsage)
+        }
+    }
+
+    // Completion callbacks use the same lifecycle boundary as state updates.
+    private func dispatchCompletion(_ completed: ThreadActivity) {
+        let callbackGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
+            self.onCompletion?(completed)
+        }
+    }
+
+    private func dispatchAsking(_ activity: ThreadActivity) {
+        let callbackGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
+            self.onAsking?(activity)
+        }
+    }
+
+    private func isCurrentLifecycle(_ callbackGeneration: UInt) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return lifecycleActive && lifecycleGeneration == callbackGeneration
     }
 
     private func scheduleExpiry() {
@@ -1364,6 +2635,7 @@ private struct ActivityGroup {
     let children: [ThreadActivity]
     let phase: ThreadPhase
     let updatedAt: Date
+    let asking: Bool
 }
 
 private struct ActivityRow {
@@ -1392,16 +2664,24 @@ private func groupActivities(_ activities: [ThreadActivity]) -> [ActivityGroup] 
     return grouped.map { key, members in
         let root = byID[key] ?? members.max(by: { $0.updatedAt < $1.updatedAt })!
         let children = members.filter { $0.id != root.id }.sorted { $0.updatedAt > $1.updatedAt }
+        let childIsRunning = children.contains { $0.phase == .running }
         return ActivityGroup(
             root: root,
             children: children,
-            phase: members.min(by: { phaseRank($0.phase) < phaseRank($1.phase) })?.phase ?? root.phase,
-            updatedAt: members.map(\.updatedAt).max() ?? root.updatedAt
+            // A stopped parent with active delegated work is still in progress
+            // as a group, but the parent itself is no longer running.
+            phase: root.phase == .stopped && childIsRunning ? .delegating : root.phase,
+            updatedAt: members.map(\.updatedAt).max() ?? root.updatedAt,
+            asking: members.contains { $0.prompt != nil }
         )
     }.sorted {
-        phaseRank($0.phase) == phaseRank($1.phase)
-            ? $0.updatedAt > $1.updatedAt
-            : phaseRank($0.phase) < phaseRank($1.phase)
+        if $0.asking != $1.asking {
+            return $0.asking
+        }
+        if phaseRank($0.phase) == phaseRank($1.phase) {
+            return $0.updatedAt > $1.updatedAt
+        }
+        return phaseRank($0.phase) < phaseRank($1.phase)
     }
 }
 
@@ -1427,7 +2707,7 @@ private func relativeAge(_ date: Date, now: Date = Date()) -> String {
 }
 
 private func rateWindowLabel(_ minutes: Int) -> String {
-    if minutes == 10_080 { return "wk" }
+    if minutes == 10_080 { return "weekly" }
     return minutes % 60 == 0 ? "\(minutes / 60)h" : "\(minutes)m"
 }
 
@@ -1448,11 +2728,19 @@ private func usageSummary(_ usage: UsageSnapshot?) -> String {
     return parts.joined(separator: " · ")
 }
 
-private func remainingUsageSummary(_ usage: UsageSnapshot?) -> String {
-    guard let usage else { return "usage unavailable" }
-    var parts = [usage.primaryLimit, usage.secondaryLimit].compactMap { $0 }
-        .sorted { $0.windowMinutes < $1.windowMinutes }
-        .map { "\(rateWindowLabel($0.windowMinutes)) \(compactPercent(max(0, 100 - $0.usedPercent)))% left" }
+private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex) -> String {
+    var parts = [agent.displayName]
+    if agent == .claude {
+        parts += [("5h", usage?.primaryLimit), ("weekly", usage?.secondaryLimit)].map { label, limit in
+            limit.map { "\(label) \(compactPercent(max(0, 100 - $0.usedPercent)))% left" } ?? "\(label) unavailable"
+        }
+    } else {
+        let limits = [usage?.primaryLimit, usage?.secondaryLimit].compactMap { $0 }
+            .sorted { $0.windowMinutes < $1.windowMinutes }
+        parts += limits.isEmpty ? ["usage unavailable"] : limits.map {
+            "\(rateWindowLabel($0.windowMinutes)) \(compactPercent(max(0, 100 - $0.usedPercent)))% left"
+        }
+    }
     if let date = nextReset(in: usage)?.resetsAt {
         parts.append("reset \(date.formatted(.dateTime.month(.abbreviated).day().hour().minute()))")
     }
@@ -1469,12 +2757,12 @@ private func piUsageSummary(_ activities: [ThreadActivity]) -> String {
     return parts.joined(separator: " · ")
 }
 
-private func opencodeUsageSummary(_ activities: [ThreadActivity]) -> String {
-    let opencodeActivities = activities.filter { $0.agent == .opencode }
-    guard !opencodeActivities.isEmpty else { return "" }
-    let tokens = opencodeActivities.compactMap { $0.usage?.totalTokens }.reduce(0, +)
-    let cost = opencodeActivities.compactMap { $0.usage?.costTotal }.reduce(0, +)
-    var parts = ["oc \(compactTokens(tokens)) tok"]
+private func agentUsageSummary(_ activities: [ThreadActivity], agent: AgentKind = .opencode) -> String {
+    let sessions = activities.filter { $0.agent == agent }
+    guard !sessions.isEmpty else { return "" }
+    let tokens = sessions.compactMap { $0.usage?.totalTokens }.reduce(0, +)
+    let cost = sessions.compactMap { $0.usage?.costTotal }.reduce(0, +)
+    var parts = ["\(agentRowLabel(agent) ?? agent.label) \(compactTokens(tokens)) tok"]
     if cost > 0 { parts.append("$\(String(format: "%.2f", cost))") }
     return parts.joined(separator: " · ")
 }
@@ -1488,6 +2776,8 @@ private enum Palette {
     static let vscodeBlue = NSColor(srgbRed: 0, green: 0.48, blue: 0.80, alpha: 1)
     static let piCyan = NSColor(srgbRed: 0.22, green: 0.78, blue: 0.96, alpha: 1)
     static let ocSilver = NSColor(srgbRed: 0.66, green: 0.65, blue: 0.64, alpha: 1)
+    static let claudeCoral = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.35, alpha: 1)
+    static let askPink = NSColor(srgbRed: 1.0, green: 0.35, blue: 0.66, alpha: 1)
     static let phosphor = NSColor(white: 0.94, alpha: 1)
     static let tertiaryInk = NSColor(white: 0.46, alpha: 1)
     static let mutedInk = NSColor(white: 0.29, alpha: 1)
@@ -1498,6 +2788,7 @@ private final class IslandView: NSView {
     private(set) var expanded = false
     private var activities: [ThreadActivity] = []
     private var accountUsage: UsageSnapshot?
+    private var claudeUsage: UsageSnapshot?
     private var topBandHeight: CGFloat = 32
     private var physicalNotchWidth: CGFloat = 0
     private var tracking: NSTrackingArea?
@@ -1508,22 +2799,31 @@ private final class IslandView: NSView {
     private var mouthOpen = true
     private var pacmanProgress: CGFloat = 0
     private let rowHeight: CGFloat = 58
-    private let footerHeight: CGFloat = 26
+    private var footerLines: [String] {
+        var lines = [remainingUsageSummary(accountUsage), remainingUsageSummary(claudeUsage, agent: .claude)]
+        let sessions = [piUsageSummary(activities), agentUsageSummary(activities),
+            agentUsageSummary(activities, agent: .opencode2), agentUsageSummary(activities, agent: .claude)]
+            .filter { !$0.isEmpty }.joined(separator: " · ")
+        if !sessions.isEmpty { lines.append(sessions) }
+        return lines
+    }
+    private var footerHeight: CGFloat { CGFloat(footerLines.count) * 15 + 11 }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Agent status")
-        setAccessibilityHelp("Hover or click to show Codex, Pi and opencode session details")
+        setAccessibilityHelp("Hover or click to show Codex, Pi, opencode, opencode2 and Claude session details, including pending questions and permission asks")
     }
 
     required init?(coder: NSCoder) { nil }
 
-    func update(activities: [ThreadActivity], accountUsage: UsageSnapshot?) {
+    func update(activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot? = nil) {
         self.activities = activities
         self.accountUsage = accountUsage
-        expandedGroupIDs.formIntersection(groupActivities(activities).map(\.root.id))
+        self.claudeUsage = claudeUsage
+        expandedGroupIDs.formIntersection(groupActivities(activities).map { activityUIIdentity($0.root) })
         syncDisclosureButtons()
         updateAnimationTimer()
         updateAccessibilityValue()
@@ -1639,7 +2939,7 @@ private final class IslandView: NSView {
                 depth: 0,
                 childCount: group.children.count
             ))
-            if expandedGroupIDs.contains(group.root.id) {
+            if expandedGroupIDs.contains(activityUIIdentity(group.root)) {
                 for child in group.children where rows.count < 8 {
                     rows.append(ActivityRow(activity: child, phase: child.phase, depth: 1, childCount: 0))
                 }
@@ -1650,7 +2950,7 @@ private final class IslandView: NSView {
 
     private func syncDisclosureButtons() {
         let rows = visibleRows
-        let groupIDs = Set(groupActivities(activities).filter { !$0.children.isEmpty }.map(\.root.id))
+        let groupIDs = Set(groupActivities(activities).filter { !$0.children.isEmpty }.map { activityUIIdentity($0.root) })
         for id in disclosureButtons.keys.filter({ !groupIDs.contains($0) }) {
             disclosureButtons.removeValue(forKey: id)?.removeFromSuperview()
         }
@@ -1668,8 +2968,9 @@ private final class IslandView: NSView {
         guard expanded else { return }
         let bodyRight = bounds.maxX - bodyInset
         for (index, row) in rows.enumerated() where row.depth == 0 && row.childCount > 0 {
-            let button = disclosureButtons[row.activity.id]!
-            button.title = "\(expandedGroupIDs.contains(row.activity.id) ? "▾" : "▸") \(row.childCount)"
+            let identity = activityUIIdentity(row.activity)
+            let button = disclosureButtons[identity]!
+            button.title = "\(expandedGroupIDs.contains(identity) ? "▾" : "▸") \(row.childCount)"
             button.toolTip = "\(row.childCount) subagent\(row.childCount == 1 ? "" : "s")"
             button.setAccessibilityLabel(button.toolTip)
             button.frame = NSRect(
@@ -1725,7 +3026,7 @@ private final class IslandView: NSView {
         let bodyLeft = bounds.minX + bodyInset
         let bodyRight = bounds.maxX - bodyInset
         let groups = groupActivities(activities)
-        let runningCount = groups.filter { $0.phase == .running }.count
+        let runningCount = groups.filter { $0.phase == .running || $0.phase == .delegating }.count
         drawText(
             String(runningCount),
             in: NSRect(x: bodyLeft + 14, y: centerY - 8, width: 28, height: 16),
@@ -1733,8 +3034,23 @@ private final class IslandView: NSView {
             color: runningCount > 0 ? Palette.phosphor : Palette.tertiaryInk
         )
 
-        if runningCount > 0 {
-            let runningAgents = Set(groups.filter { $0.phase == .running }.map(\.root.agent))
+        if let prompting = activities.first(where: { $0.prompt != nil }) {
+            drawAgentSprite(
+                agent: prompting.agent,
+                at: NSPoint(x: bodyRight - 36, y: centerY),
+                pixel: 2,
+                color: Palette.askPink,
+                running: false
+            )
+            drawQuestionMark(
+                at: NSPoint(x: bodyRight - 20, y: centerY),
+                pixel: 2,
+                color: Palette.askPink,
+                blink: mouthOpen
+            )
+            setAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
+        } else if runningCount > 0 {
+            let runningAgents = Set(groups.filter { $0.phase == .running || $0.phase == .delegating }.map(\.root.agent))
             let track = visiblePacmanTrack(
                 in: bounds,
                 bodyInset: bodyInset,
@@ -1749,12 +3065,11 @@ private final class IslandView: NSView {
                 height: bounds.height
             )).addClip()
             drawDots(after: pacmanX, from: track.lowerBound + 9, through: track.upperBound, y: centerY)
-            let lead: AgentKind = runningAgents.contains(.codex)
-                ? .codex
-                : (runningAgents.contains(.pi) ? .pi : .opencode)
+            let agentOrder: [AgentKind] = [.codex, .pi, .claude, .opencode, .opencode2]
+            let lead = agentOrder.first { runningAgents.contains($0) } ?? .codex
             drawAgentSprite(agent: lead, at: NSPoint(x: pacmanX, y: centerY), pixel: 2, color: Palette.pacYellow, running: true)
             var trailX = pacmanX - 16
-            for agent in [AgentKind.codex, .pi, .opencode]
+            for agent in agentOrder
             where agent != lead && runningAgents.contains(agent) {
                 drawAgentSprite(
                     agent: agent,
@@ -1811,19 +3126,22 @@ private final class IslandView: NSView {
             let activity = row.activity
             let rowTop = bounds.maxY - topBandHeight - CGFloat(index) * rowHeight
             let centerY = rowTop - 18
-            let color = statusColor(for: row.phase)
+            let prompt = activity.prompt
+            let color = prompt != nil ? Palette.askPink : statusColor(for: row.phase)
             let textX = bodyLeft + 35 + CGFloat(row.depth) * 18
-            let status = statusText(for: row.phase)
+            let status = prompt != nil ? "ASKING" : statusText(for: row.phase)
             let statusWidth: CGFloat = 58
             let statusX = bodyRight - statusWidth - 10
             let titleRight = row.childCount > 0 ? bodyRight - 122 : status.isEmpty ? bodyRight - 16 : statusX - 4
             let title = row.depth > 0 ? activity.nickname ?? activity.title : activity.title
             let metadata = [
+                agentRowLabel(activity.agent),
+                activity.agent == .claude ? activity.source : nil,
                 String(activity.project.prefix(18)),
                 activity.model,
                 usageSummary(activity.usage),
                 relativeAge(activity.updatedAt),
-            ].filter { !$0.isEmpty }.joined(separator: " · ")
+            ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
             drawAgentSprite(
                 agent: activity.agent,
                 at: NSPoint(x: bodyLeft + 16 + CGFloat(row.depth) * 18, y: centerY),
@@ -1845,10 +3163,10 @@ private final class IslandView: NSView {
                 alignment: .right
             )
             drawText(
-                activity.detail,
+                prompt?.line ?? activity.detail,
                 in: NSRect(x: textX, y: rowTop - 40, width: bodyRight - textX - 10, height: 12),
                 font: .monospacedSystemFont(ofSize: 9, weight: .medium),
-                color: Palette.tertiaryInk
+                color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
             )
             drawSourceMarker(agent: activity.agent, source: activity.source, in: NSRect(x: textX, y: rowTop - 53, width: 9, height: 9))
             drawText(
@@ -1864,19 +3182,15 @@ private final class IslandView: NSView {
         Palette.mutedInk.withAlphaComponent(0.3).setFill()
         NSRect(x: bodyLeft + 12, y: footerHeight + 5, width: bodyRight - bodyLeft - 24, height: 1).fill()
 
-        var parts = [piUsageSummary(activities), opencodeUsageSummary(activities)].filter { !$0.isEmpty }
-        if parts.isEmpty {
-            parts = [remainingUsageSummary(accountUsage)]
-        } else if accountUsage != nil {
-            parts.append(remainingUsageSummary(accountUsage))
+        for (index, line) in footerLines.enumerated() {
+            drawText(
+                line,
+                in: NSRect(x: bodyLeft + 12, y: footerHeight - CGFloat(index + 1) * 15, width: bodyRight - bodyLeft - 24, height: 13),
+                font: .monospacedSystemFont(ofSize: 8.5, weight: .medium),
+                color: index < 2 ? Palette.tertiaryInk : Palette.mutedInk,
+                alignment: .center
+            )
         }
-        drawText(
-            parts.joined(separator: " · "),
-            in: NSRect(x: bodyLeft + 12, y: 11, width: bodyRight - bodyLeft - 24, height: 12),
-            font: .monospacedSystemFont(ofSize: 8.5, weight: .medium),
-            color: Palette.tertiaryInk,
-            alignment: .center
-        )
     }
 
     private var expansionProgress: CGFloat {
@@ -1993,6 +3307,25 @@ private final class IslandView: NSView {
         drawPixelSprite(block, at: center, pixel: pixel, color: color.withAlphaComponent(0.55), bob: bob)
     }
 
+    private func drawQuestionMark(at center: NSPoint, pixel: CGFloat, color: NSColor, blink: Bool) {
+        let rows: [UInt8] = [
+            0b0011100,
+            0b0100010,
+            0b0000010,
+            0b0001100,
+            0b0001000,
+            0b0000000,
+            0b0001000,
+        ]
+        drawPixelSprite(
+            rows,
+            at: center,
+            pixel: pixel,
+            color: blink ? color : color.withAlphaComponent(0.45),
+            bob: false
+        )
+    }
+
     private func drawPixelSprite(_ rows: [UInt8], at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
         let origin = NSPoint(
             x: center.x - pixel * 3.5,
@@ -2017,14 +3350,25 @@ private final class IslandView: NSView {
             drawPacman(at: center, pixel: pixel, color: color, open: !running || mouthOpen)
         case .pi:
             drawPiSymbol(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
-        case .opencode:
+        case .opencode, .opencode2:
             drawOpencodeLogo(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
+        case .claude:
+            drawPixelSprite([
+                0b0100010,
+                0b0111110,
+                0b1101011,
+                0b1111111,
+                0b0111110,
+                0b0101010,
+                0b0100010,
+            ], at: center, pixel: pixel, color: color, bob: running && mouthOpen)
         }
     }
 
     private func statusColor(for phase: ThreadPhase) -> NSColor {
         switch phase {
         case .running: return Palette.pacYellow
+        case .delegating: return Palette.vscodeBlue
         case .ready: return Palette.readyGreen
         case .stopped: return Palette.stoppedOrange
         case .seen: return Palette.tertiaryInk
@@ -2034,6 +3378,7 @@ private final class IslandView: NSView {
     private func statusText(for phase: ThreadPhase) -> String {
         switch phase {
         case .running: return "RUNNING"
+        case .delegating: return "DELEGATING"
         case .ready: return ""
         case .stopped: return "STOPPED"
         case .seen: return ""
@@ -2045,8 +3390,10 @@ private final class IslandView: NSView {
         switch agent {
         case .pi:
             color = Palette.piCyan
-        case .opencode:
+        case .opencode, .opencode2:
             color = Palette.ocSilver
+        case .claude:
+            color = Palette.claudeCoral
         case .codex:
             color = ([
                 "extension": Palette.vscodeBlue,
@@ -2076,7 +3423,7 @@ private final class IslandView: NSView {
     }
 
     private func updateAnimationTimer() {
-        let shouldAnimate = activities.contains { $0.phase == .running }
+        let shouldAnimate = activities.contains { $0.phase == .running || $0.prompt != nil }
         if shouldAnimate, animationTimer == nil {
             let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
                 guard let self else { return }
@@ -2097,11 +3444,21 @@ private final class IslandView: NSView {
 
     private func updateAccessibilityValue() {
         let running = activities.filter { $0.phase == .running }.count
+        let delegating = groupActivities(activities).filter { $0.phase == .delegating }.count
         let ready = activities.filter { $0.phase == .ready }.count
         let stopped = activities.filter { $0.phase == .stopped }.count
         let seen = activities.filter { $0.phase == .seen }.count
+        let asking = activities.filter { $0.prompt != nil }.count
+        let agentCounts = [AgentKind.opencode, .opencode2, .claude].compactMap { agent -> String? in
+            let count = activities.filter { $0.agent == agent }.count
+            guard count > 0, let label = agentRowLabel(agent) else { return nil }
+            return "\(label) \(count)"
+        }.joined(separator: ", ")
         setAccessibilityValue(
-            "\(running) running, \(ready) ready, \(stopped) stopped, \(seen) seen, \(remainingUsageSummary(accountUsage))"
+            "\(asking) asking, \(running) running, \(delegating) delegating, \(ready) ready, \(stopped) stopped, \(seen) seen"
+                + (agentCounts.isEmpty ? "" : ", \(agentCounts)")
+                + ", \(remainingUsageSummary(accountUsage))"
+                + ", \(remainingUsageSummary(claudeUsage, agent: .claude))"
         )
     }
 }
@@ -2151,8 +3508,8 @@ private final class IslandController {
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
     }
 
-    func update(_ activities: [ThreadActivity], accountUsage: UsageSnapshot?) {
-        island.update(activities: activities, accountUsage: accountUsage)
+    func update(_ activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot?) {
+        island.update(activities: activities, accountUsage: accountUsage, claudeUsage: claudeUsage)
         resize(animated: true)
     }
 
@@ -2202,20 +3559,22 @@ private struct AcknowledgementPlan {
     var codexSources: Set<String> = []
     var piSources: Set<String> = []
     var opencodeSources: Set<String> = []
+    var claudeSources: Set<String> = []
 
-    var isEmpty: Bool { codexSources.isEmpty && piSources.isEmpty && opencodeSources.isEmpty }
+    var isEmpty: Bool { codexSources.isEmpty && piSources.isEmpty && opencodeSources.isEmpty && claudeSources.isEmpty }
 }
 
 private func acknowledgementPlan(for application: NSRunningApplication) -> AcknowledgementPlan {
     let identifier = application.bundleIdentifier?.lowercased() ?? ""
     let name = application.localizedName?.lowercased() ?? ""
     if identifier.contains("codex") || name == "codex" { return AcknowledgementPlan(codexSources: ["codex"]) }
+    if identifier.contains("claude") || name == "claude" { return AcknowledgementPlan(claudeSources: ["desktop"]) }
     if identifier.contains("vscode") || identifier.contains("cursor") || name.contains("visual studio code") {
-        return AcknowledgementPlan(codexSources: ["extension", "cli"], piSources: ["cli"], opencodeSources: ["cli"])
+        return AcknowledgementPlan(codexSources: ["extension", "cli"], piSources: ["cli"], opencodeSources: ["cli"], claudeSources: ["extension", "cli"])
     }
     let terminals = ["terminal", "ghostty", "iterm", "kitty", "warp", "alacritty", "wezterm"]
     return terminals.contains(where: { identifier.contains($0) || name.contains($0) })
-        ? AcknowledgementPlan(codexSources: ["cli"], piSources: ["cli"], opencodeSources: ["cli"])
+        ? AcknowledgementPlan(codexSources: ["cli"], piSources: ["cli"], opencodeSources: ["cli"], claudeSources: ["cli"])
         : AcknowledgementPlan()
 }
 
@@ -2232,7 +3591,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
 
         let island = IslandController()
         self.island = island
-        monitor.onChange = { [weak island] activities, usage in island?.update(activities, accountUsage: usage) }
+        monitor.onChange = { [weak island] activities, usage, claudeUsage in
+            island?.update(activities, accountUsage: usage, claudeUsage: claudeUsage)
+        }
         monitor.onCompletion = { activity in
             let content = UNMutableNotificationContent()
             content.title = "\(activity.agent.displayName) task complete"
@@ -2240,14 +3601,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             switch activity.agent {
             case .pi:
                 marker = "🟦"
-            case .opencode:
+            case .opencode, .opencode2:
                 marker = "⬜"
-            case .codex:
-                marker = ["extension": "🟦", "cli": "🟩", "codex": "🟪"][activity.source] ?? "⬜"
-            }
-            content.subtitle = "\(marker) \(activity.project.prefix(18))"
-            content.body = activity.title
-            NSSound(named: "Blow")?.play()
+            case .claude:
+                marker = "🟧"
+             case .codex:
+                 marker = ["extension": "🟦", "cli": "🟩", "codex": "🟪"][activity.source] ?? "⬜"
+             }
+             content.subtitle = "\(marker) \(activity.project.prefix(18))"
+             content.body = activity.title
+             content.sound = .default
+             NSSound(named: "Blow")?.play()
+            notifications.add(
+                UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil),
+                withCompletionHandler: { error in
+                    if let error { NSLog("Notification delivery failed: %@", error.localizedDescription) }
+                }
+            )
+        }
+        monitor.onAsking = { activity in
+            guard let prompt = activity.prompt else { return }
+            let content = UNMutableNotificationContent()
+             content.title = "\(activity.agent.displayName) needs you"
+             content.subtitle = "❓ \(activity.project.prefix(18))"
+             content.body = "\(prompt.verb) — \(prompt.line)"
+             content.sound = .default
+             NSSound(named: "Ping")?.play()
             notifications.add(
                 UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil),
                 withCompletionHandler: { error in
@@ -2267,7 +3646,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
                 self.monitor.acknowledge(
                     codexSources: plan.codexSources,
                     piSources: plan.piSources,
-                    opencodeSources: plan.opencodeSources
+                    opencodeSources: plan.opencodeSources,
+                    claudeSources: plan.claudeSources
                 )
             }
         }
@@ -2304,12 +3684,99 @@ private func runSelfTest() {
     assert(parsePrompt(prompt) == "whats this codebase about?")
     assert(parseModel(context) == "gpt-5.6-sol/high")
     assert(parseUsage(usage)?.contextTokens == 50_000)
+    assert(agentRowLabel(.opencode) == "oc")
+    assert(agentRowLabel(.opencode2) == "oc2")
+    assert(agentRowLabel(.codex) == nil && agentRowLabel(.pi) == nil)
+    let accountResponse = Data(#"{"rate_limit":{"primary_window":{"used_percent":12.5,"limit_window_seconds":18000,"reset_at":1800000000},"secondary_window":null}}"#.utf8)
+    assert(parseCodexUsageResponse(accountResponse)?.primary?.windowMinutes == 300)
+    assert(parseCodexUsageResponse(accountResponse)?.secondary == nil)
+    let claudeResponse = Data(#"{"five_hour":{"utilization":12.5,"resets_at":"2026-10-20T18:00:00.123Z"},"seven_day":{"utilization":43.25,"resets_at":"2026-10-26T18:00:00Z"}}"#.utf8)
+    let claudeLimits = parseClaudeUsageResponse(claudeResponse)
+    assert(claudeLimits?.primary?.usedPercent == 12.5 && claudeLimits?.primary?.windowMinutes == 300)
+    assert(claudeLimits?.secondary?.usedPercent == 43.25 && claudeLimits?.secondary?.windowMinutes == 10_080)
+    assert(claudeLimits?.primary?.resetsAt != nil && claudeLimits?.secondary?.resetsAt != nil)
+    let claudeAccountUsage = effectiveUsage(local: nil, remote: claudeLimits)
+    assert(remainingUsageSummary(claudeAccountUsage, agent: .claude).hasPrefix("Claude · 5h 87.5% left · weekly 56.75% left"))
+    let weeklyOnly = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":{"utilization":35}}"#.utf8))
+    assert(remainingUsageSummary(effectiveUsage(local: nil, remote: weeklyOnly), agent: .claude)
+        == "Claude · 5h unavailable · weekly 65% left")
+    assert(remainingUsageSummary(nil, agent: .claude) == "Claude · 5h unavailable · weekly unavailable")
+    assert(parseClaudeUsageResponse(Data(#"{"error":"unauthorized"}"#.utf8)) == nil)
+    assert(parseClaudeUsageResponse(Data("broken json".utf8)) == nil)
+    let invalidWindows = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"35"}}"#.utf8))
+    assert(invalidWindows?.primary == nil && invalidWindows?.secondary == nil)
+    assert(parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":-1},"seven_day":{"utilization":40}}"#.utf8))?.primary == nil)
+    assert(parseClaudeAccessToken(Data(#"{"claudeAiOauth":{"accessToken":"test-token"}}"#.utf8)) == "test-token")
+    assert(parseClaudeAccessToken(Data(#"{"claudeAiOauth":{"accessToken":" "}}"#.utf8)) == nil)
+    assert(parseClaudeAccessToken(Data(#"{"mcpOAuth":{"accessToken":"test-token"}}"#.utf8)) == nil)
+    let nativeRateLimits = RemoteRateLimits(
+        primary: RateLimitUsage(usedPercent: 10, windowMinutes: 60, resetsAt: nil),
+        secondary: RateLimitUsage(usedPercent: 20, windowMinutes: 120, resetsAt: nil)
+    )
+    let remoteRateLimits = RemoteRateLimits(
+        primary: RateLimitUsage(usedPercent: 30, windowMinutes: 300, resetsAt: nil),
+        secondary: RateLimitUsage(usedPercent: 40, windowMinutes: 10080, resetsAt: nil)
+    )
+    let nativeUsage = UsageSnapshot(
+        totalTokens: 1_000,
+        contextTokens: 800,
+        contextWindow: 4_000,
+        primaryLimit: nativeRateLimits.primary,
+        secondaryLimit: nativeRateLimits.secondary,
+        costTotal: 0.25
+    )
+    let laterNativeUsage = UsageSnapshot(
+        totalTokens: 2_000,
+        contextTokens: 1_600,
+        contextWindow: 4_000,
+        primaryLimit: RateLimitUsage(usedPercent: 11, windowMinutes: 60, resetsAt: nil),
+        secondaryLimit: RateLimitUsage(usedPercent: 21, windowMinutes: 120, resetsAt: nil),
+        costTotal: 0.5
+    )
+    assert(effectiveUsage(local: nil, remote: nil) == nil)
+    assert(effectiveUsage(local: nativeUsage, remote: nil) == nativeUsage)
+    let remoteOnlyUsage = effectiveUsage(local: nil, remote: remoteRateLimits)
+    assert(remoteOnlyUsage == UsageSnapshot(
+        totalTokens: 0,
+        contextTokens: 0,
+        contextWindow: 0,
+        primaryLimit: remoteRateLimits.primary,
+        secondaryLimit: remoteRateLimits.secondary,
+        costTotal: nil
+    ))
+    assert(remainingUsageSummary(remoteOnlyUsage).hasPrefix("Codex"), "Account limits must identify Codex separately from Claude")
+    assert(!remainingUsageSummary(remoteOnlyUsage).contains("usage unavailable"))
+    assert(remainingUsageSummary(remoteOnlyUsage).contains("5h 70% left"))
+    assert(remainingUsageSummary(remoteOnlyUsage).contains("weekly 60% left"))
+    let mergedUsage = effectiveUsage(local: nativeUsage, remote: remoteRateLimits)
+    assert(mergedUsage?.primaryLimit == remoteRateLimits.primary)
+    assert(mergedUsage?.secondaryLimit == remoteRateLimits.secondary)
+    assert(mergedUsage?.totalTokens == nativeUsage.totalTokens)
+    assert(mergedUsage?.contextTokens == nativeUsage.contextTokens)
+    assert(mergedUsage?.contextWindow == nativeUsage.contextWindow)
+    assert(mergedUsage?.costTotal == nativeUsage.costTotal)
+    let updatedMergedUsage = effectiveUsage(local: laterNativeUsage, remote: remoteRateLimits)
+    assert(updatedMergedUsage?.totalTokens == laterNativeUsage.totalTokens)
+    assert(updatedMergedUsage?.contextTokens == laterNativeUsage.contextTokens)
+    assert(updatedMergedUsage?.primaryLimit == remoteRateLimits.primary)
+    assert(updatedMergedUsage?.secondaryLimit == remoteRateLimits.secondary)
     assert(usageSummary(parseUsage(usage)) == "ctx 20% · 120k tok")
     assert(nextReset(in: parseUsage(usage))?.windowMinutes == 300)
     assert(remainingUsageSummary(parseUsage(usage)).contains("5h 87.66% left"))
     assert(remainingUsageSummary(parseUsage(usage)).contains("reset"))
     assert(relativeAge(Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 3600)) == "1h")
     assert(parseResponse(unrelated) == nil)
+    let codexEscalation = Data(#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_escalate","arguments":"{\"cmd\":\"rm -rf /tmp/x\",\"sandbox_permissions\":\"require_escalated\"}"}}"#.utf8)
+    let codexQuestion = Data(#"{"type":"response_item","payload":{"type":"request_user_input","call_id":"call_question","questions":[{"question":"Deploy now?"}]}}"#.utf8)
+    let codexFunctionQuestion = Data(#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_function_question","arguments":"{\"questions\":[{\"question\":\"Use the new config?\"}]}"}}"#.utf8)
+    let codexResult = Data(#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_escalate","output":"ok"}}"#.utf8)
+    assert(parseCodexPendingPrompt(codexEscalation)?.kind == .permission)
+    assert(parseCodexPendingPrompt(codexEscalation)?.text == "rm -rf /tmp/x")
+    assert(parseCodexPendingPrompt(codexQuestion)?.kind == .question)
+    assert(parseCodexPendingPrompt(codexQuestion)?.text == "Deploy now?")
+    assert(parseCodexPendingPrompt(codexFunctionQuestion)?.kind == .question)
+    assert(parseCodexPendingPrompt(codexFunctionQuestion)?.text == "Use the new config?")
+    assert(parseCodexResolvedCallID(codexResult) == "call_escalate")
     assert(shouldRetain(.running, updatedAt: .distantPast))
     assert(shouldRetain(.ready, updatedAt: Date().addingTimeInterval(-activityRetention + 1)))
     assert(!shouldRetain(.stopped, updatedAt: Date().addingTimeInterval(-activityRetention - 1)))
@@ -2320,6 +3787,8 @@ private func runSelfTest() {
     let piToolUseEntry = Data(#"{"type":"message","id":"b1","parentId":"a1","timestamp":"2026-08-15T18:56:14.404Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"bash","arguments":{}}],"api":"openai-completions","provider":"zai","model":"glm-5.3","usage":{"input":1500,"output":200,"cacheRead":500,"cacheWrite":0,"totalTokens":2200,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.1}},"stopReason":"toolUse","timestamp":1786820171267}}"#.utf8)
     let piDoneEntry = Data(#"{"type":"message","id":"c1","parentId":"b1","timestamp":"2026-08-15T18:57:00.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"All done.\nShip it."}],"api":"openai-completions","provider":"zai","model":"glm-5.3","usage":{"input":2000,"output":300,"cacheRead":500,"cacheWrite":0,"totalTokens":2800,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.4}},"stopReason":"stop","timestamp":1786820220000}}"#.utf8)
     let piAbortedEntry = Data(#"{"type":"message","id":"d1","parentId":"c1","timestamp":"2026-08-15T18:58:00.000Z","message":{"role":"assistant","content":[],"provider":"zai","model":"glm-5.3","usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0}},"stopReason":"aborted","timestamp":1786820280000}}"#.utf8)
+    let piAskEntry = Data(#"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-15T19:10:00.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_pi_ask1","name":"ask_user_question","arguments":{"question":"Deploy to production?"}}],"provider":"zai","model":"glm-5.3","stopReason":"toolUse","timestamp":1786821000000}}"#.utf8)
+    let piAskResultEntry = Data(#"{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-15T19:10:05.000Z","message":{"role":"toolResult","toolCallId":"call_pi_ask1","toolName":"ask_user_question","isError":false,"timestamp":1786821005000}}"#.utf8)
     let piModelChange = Data(#"{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-15T18:55:41.106Z","provider":"zai","modelId":"glm-5.3"}"#.utf8)
     let piThinkingChange = Data(#"{"type":"thinking_level_change","id":"t1","parentId":"m1","timestamp":"2026-08-15T18:55:41.106Z","thinkingLevel":"high"}"#.utf8)
     let piSessionInfo = Data(#"{"type":"session_info","id":"s1","parentId":"t1","timestamp":"2026-08-15T18:55:41.106Z","name":"Refactor auth"}"#.utf8)
@@ -2337,22 +3806,111 @@ private func runSelfTest() {
     assert(piTurnEvent(parsePiEvent(piToolUseEntry)!) == nil)
     assert(piTurnEvent(parsePiEvent(piModelChange)!) == nil)
     assert(parsePiEvent(piIrrelevant) == nil)
+    assert(parsePiToolCalls(piAskEntry)?.first?.name == "ask_user_question")
+    assert(parsePiToolCalls(piAskEntry)?.first?.text == "Deploy to production?")
+    let piPermissionEntry = Data(#"{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_pi_permission","name":"request_permission","arguments":{"path":"/tmp/x"}}]}}"#.utf8)
+    assert(parsePiToolCalls(piPermissionEntry)?.first?.permission == true)
+    assert(parsePiToolCalls(piAskResultEntry) == nil)
+    assert(parsePiToolResultID(piAskResultEntry) == "call_pi_ask1")
+    assert(parsePiToolResultID(piAskEntry) == nil)
     let ocUserHeader = parseOpencodeMessageHeader(Data(#"{"role":"user","time":{"created":1786825803000}}"#.utf8))
     let ocStreamingHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","modelID":"glm-5.3","providerID":"zai-coding-plan","variant":"high","agent":"build","time":{"created":1786825803000}}"#.utf8))
     let ocDoneHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","modelID":"glm-5.3","variant":"high","time":{"created":1786825803000,"completed":1786825806000},"finish":"stop","tokens":{"input":100,"output":50,"reasoning":0,"cache":{"read":300,"write":10}},"cost":0.01}"#.utf8))
     let ocAbortHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","time":{"created":1786825803000,"completed":1786825806000},"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}"#.utf8))
+    let ocAbortingHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","time":{"created":1786825803000,"completed":null},"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}"#.utf8))
+    let ocNullCompletionHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","time":{"created":1786825803000,"completed":null},"finish":"stop"}"#.utf8))
+    let ocToolCallHeader = parseOpencodeMessageHeader(Data(#"{"role":"assistant","time":{"created":1786825803000,"completed":1786825806000},"finish":"tool-calls"}"#.utf8))
+    let ocV2Message = parseOpencodeV2Message(
+        id: "v2",
+        role: "assistant",
+        data: Data(#"{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"reasoning","text":"skip"},{"type":"tool","state":{"status":"completed"}},{"type":"text","text":"v2 reply"}],"time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":1,"write":1}}}"#.utf8)
+    )
+    let ocV2UserMessage = parseOpencodeV2Message(id: "v2u", role: "user", data: Data(#"{"text":"v2 prompt","time":{"created":1}}"#.utf8))
     assert(ocUserHeader?.role == "user")
     assert(ocStreamingHeader?.completed == false)
     assert(ocDoneHeader?.contextTokens == 460)
     assert(ocAbortHeader?.aborted == true)
+    assert(ocNullCompletionHeader?.completed == false)
     assert(opencodeTurnEvent(ocUserHeader) == .started)
     assert(opencodeTurnEvent(ocStreamingHeader) == .started)
     assert(opencodeTurnEvent(ocDoneHeader) == .completed)
     assert(opencodeTurnEvent(ocAbortHeader) == .cancelled)
+    assert(opencodeTurnEvent(ocAbortingHeader) == .cancelled)
+    assert(opencodeTurnEvent(ocNullCompletionHeader) == .started)
+    assert(opencodeTurnEvent(ocToolCallHeader) == .started)
     assert(opencodeTurnEvent(nil) == nil)
+    assert(ocV2Message?.header.modelID == "glm-5.3")
+    assert(ocV2Message?.header.variant == "high")
+    assert(ocV2Message?.header.contextTokens == 17)
+    assert(opencodeTurnEvent(ocV2Message?.header) == .completed)
+    assert(ocV2Message?.text == "v2 reply")
+    assert(ocV2UserMessage?.text == "v2 prompt")
+    assert(opencodeTurnEvent(ocV2UserMessage?.header) == .started)
     assert(opencodeModelLabel(modelID: "glm-5.3", variant: "high") == "glm-5.3/high")
     assert(opencodeModelLabel(modelID: "glm-5.3", variant: nil) == "glm-5.3")
     assert(opencodeSessionModel(#"{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"}"#) == "glm-5.3/high")
+    assert(isAskToolName("ask_user_question") && isAskToolName("Ask") && isAskToolName("question"))
+    assert(!isAskToolName("bash") && !isAskToolName("task"))
+    let questionObservation = OpencodeToolObservation(
+        callID: "q1",
+        name: "question",
+        status: "running",
+        input: ["questions": [["question": "Ship it?"]]],
+        progressed: false,
+        createdAt: Date()
+    )
+    assert(opencodePrompt(from: [questionObservation], askingEvents: [])?.kind == .question)
+    assert(opencodePrompt(from: [questionObservation], askingEvents: [])?.text == "Ship it?")
+    let freshBash = OpencodeToolObservation(
+        callID: "b1", name: "bash", status: "running", input: ["command": "ls"],
+        progressed: false, createdAt: Date()
+    )
+    assert(opencodePrompt(from: [freshBash], askingEvents: []) == nil)
+    let stalledBash = OpencodeToolObservation(
+        callID: "b2", name: "bash", status: "running", input: ["command": "ls"],
+        progressed: false, createdAt: Date().addingTimeInterval(-opencodePromptDebounce - 1)
+    )
+    // a stalled tool alone is just a silent command: the run log must confirm an ask
+    assert(opencodePrompt(from: [stalledBash], askingEvents: []) == nil)
+    let matchedAsk = OpencodeAskingEvent(id: "per_1", permission: "bash", at: stalledBash.createdAt.addingTimeInterval(1))
+    let staleAsk = OpencodeAskingEvent(id: "per_2", permission: "bash", at: stalledBash.createdAt.addingTimeInterval(-60))
+    assert(opencodePrompt(from: [stalledBash], askingEvents: [matchedAsk])?.kind == .permission)
+    assert(opencodePrompt(from: [stalledBash], askingEvents: [staleAsk]) == nil)
+    assert(opencodePrompt(from: [stalledBash], askingEvents: [matchedAsk])?.line == "bash: ls")
+    let pendingRead = OpencodeToolObservation(
+        callID: "b-pending", name: "read", status: "pending", input: ["filePath": "/tmp/file"],
+        progressed: false, createdAt: stalledBash.createdAt
+    )
+    let externalDirectoryAsk = OpencodeAskingEvent(
+        id: "per-external", permission: "external_directory", at: pendingRead.createdAt.addingTimeInterval(1)
+    )
+    assert(opencodePrompt(from: [pendingRead], askingEvents: [externalDirectoryAsk])?.kind == .permission)
+    let progressingBash = OpencodeToolObservation(
+        callID: "b3", name: "bash", status: "running", input: ["command": "ls"],
+        progressed: true, createdAt: Date().addingTimeInterval(-opencodePromptDebounce - 1)
+    )
+    assert(opencodePrompt(from: [progressingBash], askingEvents: [matchedAsk]) == nil)
+    let completedBash = OpencodeToolObservation(
+        callID: "b4", name: "bash", status: "completed", input: [:],
+        progressed: true, createdAt: Date().addingTimeInterval(-opencodePromptDebounce - 1)
+    )
+    assert(opencodePrompt(from: [completedBash], askingEvents: [matchedAsk]) == nil)
+    let taskObservation = OpencodeToolObservation(
+        callID: "t1", name: "task", status: "running", input: [:],
+        progressed: false, createdAt: Date().addingTimeInterval(-opencodePromptDebounce - 1)
+    )
+    assert(opencodePrompt(from: [taskObservation], askingEvents: [matchedAsk]) == nil)
+    let askLogLine = "timestamp=2026-08-16T06:03:32.310Z level=INFO run=49983bf6 message=asking id=per_0092b10560019BBvJr2ITQriAG permission=external_directory patterns=\"[\\\"/Users/parag/codebase/projects/caregiving/*\\\"]\""
+    assert(parseOpencodeAskingLine(askLogLine)?.id == "per_0092b10560019BBvJr2ITQriAG")
+    assert(parseOpencodeAskingLine(askLogLine)?.permission == "external_directory")
+    assert(parseOpencodeAskingLine(askLogLine)?.at == Date(timeIntervalSince1970: 1786860212.31))
+    assert(parseOpencodeAskingLine("timestamp=2026-08-16T06:05:13.279Z level=INFO run=49983bf6 message=evaluated permission=bash action.action=allow") == nil)
+    assert(parseOpencodeAskingLine("timestamp=2026-08-16T06:03:32.310Z level=INFO run=49983bf6 message=asking id=que_0092b10560019BBvJr2ITQriAG questions=2") == nil)
+    assert(parseOpencodePending(id: "pending-1", type: "external_directory", data: #"{"path":"/tmp"}"#)?.kind == .permission)
+    assert(parseOpencodePending(id: "pending-2", type: "question", data: #"{"questions":[{"question":"Continue?"}]}"#)?.kind == .question)
+    assert(parseOpencodePending(id: "pending-3", type: "pending", data: #"{"request":{"type":"permission","action":"allow","resources":["/tmp"]}}"#)?.kind == .permission)
+    assert(parseOpencodePending(id: "pending-4", type: "pending", data: #"{"type":"compaction_barrier"}"#) == nil)
+    assert(parseOpencodePending(id: "pending-5", type: "pending", data: #"{"input":"ordinary user input"}"#) == nil)
     assert(shouldMarkStopped(.running, updatedAt: Date().addingTimeInterval(-opencodeRunningInactivityTimeout - 1), timeout: opencodeRunningInactivityTimeout))
     let track = visiblePacmanTrack(
         in: NSRect(x: 0, y: 0, width: 360, height: 37),
@@ -2378,12 +3936,15 @@ private func runSelfTest() {
         .appendingPathComponent("notch-status-xdg-\(UUID().uuidString)", isDirectory: true)
     try! FileManager.default.createDirectory(at: emptyDataHome, withIntermediateDirectories: true)
     setenv("XDG_DATA_HOME", emptyDataHome.path, 1)
+    setenv("CLAUDE_CONFIG_DIR", emptyDataHome.appendingPathComponent("claude").path, 1)
 
     let monitor = SessionMonitor()
     var latest: [ThreadActivity] = []
     var completions: [ThreadActivity] = []
-    monitor.onChange = { activities, _ in latest = activities }
+    var askings: [ThreadActivity] = []
+    monitor.onChange = { activities, _, _ in latest = activities }
     monitor.onCompletion = { completions.append($0) }
+    monitor.onAsking = { askings.append($0) }
     monitor.start()
     assert(waitUntil {
         latest.contains { $0.id == "self-test" && $0.phase == .running }
@@ -2404,7 +3965,8 @@ private func runSelfTest() {
     try! handle.close()
     assert(waitUntil(timeout: 3) { latest.first(where: { $0.id == "self-test" })?.phase == .ready && completions.count == 1 })
     assert(completions.first?.id == "self-test")
-    assert(groupActivities(latest).first { $0.root.id == "self-test" }?.phase == .running)
+    // A child may still be active without changing the completed parent row.
+    assert(groupActivities(latest).first { $0.root.id == "self-test" }?.phase == .ready)
     let childHandle = try! FileHandle(forWritingTo: childSession)
     try! childHandle.seekToEnd()
     try! childHandle.write(contentsOf: completed + Data("\n".utf8))
@@ -2413,6 +3975,23 @@ private func runSelfTest() {
     assert(completions.count == 1)
     monitor.acknowledge(codexSources: ["extension"], piSources: [], opencodeSources: [])
     assert(waitUntil { latest.first(where: { $0.id == "self-test" })?.phase == .seen })
+
+    // The VS Code extension resumes threads whose rollouts live in old date
+    // directories; the state_N.sqlite threads index must surface them.
+    let oldDay = root.appendingPathComponent("sessions/2001/01/01", isDirectory: true)
+    try! FileManager.default.createDirectory(at: oldDay, withIntermediateDirectories: true)
+    let oldSession = oldDay.appendingPathComponent("rollout-old.jsonl")
+    let oldMeta = #"{"type":"session_meta","payload":{"id":"self-test-old","source":"vscode","originator":"codex_vscode","cwd":"/tmp/workspace"}}"#
+    try! Data("\(oldMeta)\n\(String(decoding: started, as: UTF8.self))\n".utf8).write(to: oldSession)
+    var indexDB: OpaquePointer?
+    assert(sqlite3_open_v2(root.appendingPathComponent("state_1.sqlite").path, &indexDB, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+    guard let indexDB else { fatalError("sqlite open failed") }
+    assert(sqlite3_exec(indexDB, "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL)", nil, nil, nil) == SQLITE_OK)
+    assert(sqlite3_exec(indexDB, "INSERT INTO threads VALUES ('self-test-old', '\(oldSession.path)', \(Int(Date().timeIntervalSince1970)), 0)", nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(indexDB)
+    assert(waitUntil(timeout: 3) {
+        latest.contains { $0.id == "self-test-old" && $0.phase == .running && $0.source == "extension" }
+    })
 
     let shellSnapshots = root.appendingPathComponent("shell_snapshots")
     try! FileManager.default.createDirectory(at: shellSnapshots, withIntermediateDirectories: true)
@@ -2443,8 +4022,9 @@ private func runSelfTest() {
     setenv("PI_CODING_AGENT_DIR", piRoot.path, 1)
 
     let piMonitor = SessionMonitor()
-    piMonitor.onChange = { activities, _ in latest = activities }
+    piMonitor.onChange = { activities, _, _ in latest = activities }
     piMonitor.onCompletion = { completions.append($0) }
+    piMonitor.onAsking = { askings.append($0) }
     piMonitor.start()
     assert(waitUntil(timeout: 3) {
         latest.first { $0.id == "pi-test" }.map { $0.agent == .pi && $0.phase == .running } ?? false
@@ -2489,20 +4069,47 @@ private func runSelfTest() {
     try! secondTurn.write(contentsOf: piAbortedEntry + Data("\n".utf8))
     try! secondTurn.close()
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "pi-test" }?.phase == .stopped })
+
+    // ask flow: an ask-type tool parks the turn on the user until it is answered
+    let askTurn = try! FileHandle(forWritingTo: piSession)
+    try! askTurn.seekToEnd()
+    try! askTurn.write(contentsOf: piUserEntry + Data("\n".utf8))
+    try! askTurn.write(contentsOf: piAskEntry + Data("\n".utf8))
+    try! askTurn.close()
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "pi-test" }.map {
+            $0.phase == .running && $0.prompt?.kind == .question && $0.prompt?.text == "Deploy to production?"
+        } ?? false
+    })
+    assert(askings.filter { $0.id == "pi-test" && $0.agent == .pi }.count == 1)
+    assert(groupActivities(latest).first { $0.root.id == "pi-test" }?.asking == true)
+    let answerTurn = try! FileHandle(forWritingTo: piSession)
+    try! answerTurn.seekToEnd()
+    try! answerTurn.write(contentsOf: piAskResultEntry + Data("\n".utf8))
+    try! answerTurn.close()
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "pi-test" }?.prompt == nil })
+    let cancelledAskTurn = try! FileHandle(forWritingTo: piSession)
+    try! cancelledAskTurn.seekToEnd()
+    try! cancelledAskTurn.write(contentsOf: piUserEntry + Data("\n".utf8))
+    try! cancelledAskTurn.write(contentsOf: piAskEntry + Data("\n".utf8))
+    try! cancelledAskTurn.write(contentsOf: piAbortedEntry + Data("\n".utf8))
+    try! cancelledAskTurn.close()
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "pi-test" }?.prompt == nil })
     piMonitor.stop()
     try? FileManager.default.removeItem(at: piRoot)
 
     // opencode monitor: sqlite lifecycle, titles, model/usage labels, aborts, subagent grouping.
+    // one database holds both the legacy (v1) tables and the v2 tables the opencode2 binary writes.
     let ocRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("notch-status-oc-\(UUID().uuidString)", isDirectory: true)
     let ocData = ocRoot.appendingPathComponent("opencode", isDirectory: true)
     try! FileManager.default.createDirectory(at: ocData, withIntermediateDirectories: true)
     let ocDB = ocData.appendingPathComponent("opencode.db")
 
-    func opencodeExecute(_ sql: String) {
+    func opencodeExecute(_ sql: String, at databaseURL: URL = ocDB) {
         var database: OpaquePointer?
         defer { sqlite3_close(database) }
-        guard sqlite3_open_v2(ocDB.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
               sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
             assertionFailure()
             return
@@ -2510,6 +4117,7 @@ private func runSelfTest() {
     }
 
     opencodeExecute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, title text NOT NULL, directory text NOT NULL, agent text, model text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL, tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer); CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL); CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);")
+    opencodeExecute("CREATE TABLE session_v2 (id text PRIMARY KEY, parent_id text, title text, directory text NOT NULL, agent text, model text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL, tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer); CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);")
     setenv("XDG_DATA_HOME", ocRoot.path, 1)
 
     let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -2519,14 +4127,21 @@ private func runSelfTest() {
     INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1', 'ses_oc-1', \(nowMs - 8000), \(nowMs - 8000), '{"role":"user","time":{"created":\(nowMs - 8000)}}');
     INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('p1', 'm1', 'ses_oc-1', \(nowMs - 8000), \(nowMs - 8000), '{"type":"text","text":"add opencode support please"}');
     INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2', 'ses_oc-1', \(nowMs - 1000), \(nowMs - 1000), '{"role":"assistant","modelID":"glm-5.3","variant":"high","time":{"created":\(nowMs - 1000)}}');
+    INSERT INTO session_v2 (id, parent_id, title, directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived)
+    VALUES ('ses_v2-1', NULL, 'Port to v2', '/tmp/workspace', 'build', '{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"}', 0.02, 10, 20, 0, 0, 0, \(nowMs - 8000), \(nowMs - 1000), NULL);
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m1', 'ses_v2-1', 'user', 1, \(nowMs - 8000), \(nowMs - 8000), '{"text":"add v2 support please","time":{"created":\(nowMs - 8000)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m2', 'ses_v2-1', 'assistant', 2, \(nowMs - 1000), \(nowMs - 1000), '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":""}],"time":{"created":\(nowMs - 1000)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2x1', 'ses_v2-1', 'model-switched', 3, \(nowMs - 900), \(nowMs - 900), '{"model":{"id":"ignored"}}');
     """)
 
     let ocMonitor = SessionMonitor()
-    ocMonitor.onChange = { activities, _ in latest = activities }
+    ocMonitor.onChange = { activities, _, _ in latest = activities }
     ocMonitor.onCompletion = { completions.append($0) }
+    ocMonitor.onAsking = { askings.append($0) }
     ocMonitor.start()
     assert(waitUntil(timeout: 3) {
         latest.first { $0.id == "ses_oc-1" }.map { $0.agent == .opencode && $0.phase == .running } ?? false
+            && latest.first { $0.id == "ses_v2-1" }.map { $0.agent == .opencode2 && $0.phase == .running } ?? false
     })
     let ocActivity = latest.first { $0.id == "ses_oc-1" }
     assert(ocActivity?.title == "Ship the widget")
@@ -2534,6 +4149,10 @@ private func runSelfTest() {
     assert(ocActivity?.project == "workspace")
     assert(ocActivity?.source == "cli")
     assert(ocActivity?.detail == "")
+    let oc2Activity = latest.first { $0.id == "ses_v2-1" }
+    assert(oc2Activity?.title == "Port to v2")
+    assert(oc2Activity?.model == "glm-5.3/high")
+    assert(oc2Activity?.detail == "")
 
     opencodeExecute("""
     INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('p2', 'm2', 'ses_oc-1', \(nowMs + 1000), \(nowMs + 1000), '{"type":"text","text":"Done. Shipped."}');
@@ -2549,9 +4168,24 @@ private func runSelfTest() {
     assert(ocFinished?.usage?.contextTokens == 460)
     assert(ocFinished?.usage?.costTotal == 0.0123)
     assert(usageSummary(ocFinished?.usage) == "4k tok")
-    assert(opencodeUsageSummary(latest) == "oc 4k tok · $0.01")
+    assert(agentUsageSummary(latest) == "oc 4k tok · $0.01")
+
+    opencodeExecute("""
+    UPDATE session_message SET data = '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"reasoning","text":"thinking"},{"type":"tool","state":{"status":"completed"}},{"type":"text","text":"Done. v2 shipped."}],"time":{"created":\(nowMs - 1000),"completed":\(nowMs + 2000)},"finish":"stop","tokens":{"input":100,"output":50,"reasoning":0,"cache":{"read":300,"write":10}},"cost":0.01}', time_updated = \(nowMs + 2000) WHERE id = 'v2m2';
+    UPDATE session_v2 SET time_updated = \(nowMs + 2000) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "ses_v2-1" }.map { $0.phase == .ready && $0.detail == "Done. v2 shipped." } ?? false
+            && completions.contains { $0.id == "ses_v2-1" && $0.agent == .opencode2 }
+    })
+    let oc2Finished = latest.first { $0.id == "ses_v2-1" }
+    assert(oc2Finished?.usage?.totalTokens == 30)
+    assert(oc2Finished?.usage?.contextTokens == 460)
+    assert(oc2Finished?.usage?.costTotal == 0.02)
+    assert(agentUsageSummary(latest, agent: .opencode2) == "oc2 30 tok · $0.02")
     ocMonitor.acknowledge(codexSources: [], piSources: [], opencodeSources: ["cli"])
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_oc-1" }?.phase == .seen })
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .seen })
 
     opencodeExecute("""
     INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m3', 'ses_oc-1', \(nowMs + 3000), \(nowMs + 3000), '{"role":"user","time":{"created":\(nowMs + 3000)}}');
@@ -2579,10 +4213,319 @@ private func runSelfTest() {
     UPDATE session SET time_updated = \(nowMs + 6000) WHERE id = 'ses_oc-1';
     """)
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_oc-1" }?.phase == .stopped })
+    assert(groupActivities(latest).first { $0.root.id == "ses_oc-1" }?.phase == .delegating)
+
+    // v1 ask flow: a bash tool parks on a permission dialog, then clears on approval
+    let ocLogDir = ocData.appendingPathComponent("log", isDirectory: true)
+    try! FileManager.default.createDirectory(at: ocLogDir, withIntermediateDirectories: true)
+    let askStamp = ISO8601DateFormatter()
+    askStamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let ocAskLogLine = "timestamp=\(askStamp.string(from: Date(timeIntervalSince1970: Double(nowMs - 12000) / 1000))) level=INFO run=selftest message=asking id=per_test0001 permission=bash patterns=\"[\\\"rm -rf /tmp/precious\\\"]\"\n"
+    let ocLogFile = ocLogDir.appendingPathComponent("opencode.log")
+    if !FileManager.default.fileExists(atPath: ocLogFile.path) {
+        try! Data().write(to: ocLogFile)
+    }
+    let ocLogHandle = try! FileHandle(forWritingTo: ocLogFile)
+    try! ocLogHandle.seekToEnd()
+    try! ocLogHandle.write(contentsOf: Data(ocAskLogLine.utf8))
+    try! ocLogHandle.close()
+    opencodeExecute("""
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m8', 'ses_oc-1', \(nowMs + 7000), \(nowMs + 7000), '{"role":"user","time":{"created":\(nowMs + 7000)}}');
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m9', 'ses_oc-1', \(nowMs + 7200), \(nowMs + 7200), '{"role":"assistant","modelID":"glm-5.3","variant":"high","time":{"created":\(nowMs + 7200)}}');
+    INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('p_ask', 'm9', 'ses_oc-1', \(nowMs - 12000), \(nowMs - 12000), '{"type":"tool","tool":"bash","callID":"call_oc_ask1","state":{"status":"running","input":{"command":"rm -rf /tmp/precious"},"time":{"start":\(nowMs - 12000)}}}');
+    UPDATE session SET time_updated = \(nowMs + 7200) WHERE id = 'ses_oc-1';
+    """)
+    assert(waitUntil(timeout: 4) {
+        latest.first { $0.id == "ses_oc-1" }.map { $0.phase == .running && $0.prompt?.kind == .permission } ?? false
+    })
+    assert(latest.first { $0.id == "ses_oc-1" }?.prompt?.line == "bash: rm -rf /tmp/precious")
+    assert(askings.filter { $0.id == "ses_oc-1" && $0.prompt?.callID == "call_oc_ask1" }.count == 1)
+    assert(groupActivities(latest).first { $0.root.id == "ses_oc-1" }?.asking == true)
+    opencodeExecute("""
+    UPDATE part SET data = '{"type":"tool","tool":"bash","callID":"call_oc_ask1","state":{"status":"completed","input":{"command":"rm -rf /tmp/precious"},"output":"done","metadata":{"output":"done"},"title":"bash","time":{"start":\(nowMs - 12000),"end":\(nowMs + 7300)}}}', time_updated = \(nowMs + 7300) WHERE id = 'p_ask';
+    UPDATE message SET data = '{"role":"assistant","modelID":"glm-5.3","variant":"high","time":{"created":\(nowMs + 7200),"completed":\(nowMs + 7400)},"finish":"stop"}', time_updated = \(nowMs + 7400) WHERE id = 'm9';
+    UPDATE session SET time_updated = \(nowMs + 7400) WHERE id = 'ses_oc-1';
+    """)
+    assert(waitUntil(timeout: 4) {
+        let oc1 = latest.first { $0.id == "ses_oc-1" }
+        return oc1?.prompt == nil && oc1?.phase == .ready
+    })
+
+    // v2 second turn: a tool-call segment must keep the turn running instead of flashing ready
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m3', 'ses_v2-1', 'user', 4, \(nowMs + 8000), \(nowMs + 8000), '{"text":"go again","time":{"created":\(nowMs + 8000)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m4', 'ses_v2-1', 'assistant', 5, \(nowMs + 8100), \(nowMs + 8100), '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"tool","state":{"status":"completed"}}],"time":{"created":\(nowMs + 8100),"completed":\(nowMs + 8200)},"finish":"tool-calls"}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 8200) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .running })
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m5', 'ses_v2-1', 'assistant', 6, \(nowMs + 8300), \(nowMs + 8300), '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"text","text":"All done."}],"time":{"created":\(nowMs + 8300),"completed":\(nowMs + 8400)},"finish":"stop"}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 8400) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .ready })
+
+    // v2 subagent: null title falls back to its prompt text
+    opencodeExecute("""
+    INSERT INTO session_v2 (id, parent_id, title, directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived)
+    VALUES ('ses_v2-2', 'ses_v2-1', NULL, '/tmp/workspace', 'explore', NULL, 0, 100, 20, 0, 0, 0, \(nowMs + 8500), \(nowMs + 8700), NULL);
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m6', 'ses_v2-2', 'user', 1, \(nowMs + 8600), \(nowMs + 8600), '{"text":"explore the repo","time":{"created":\(nowMs + 8600)}}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 8800) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "ses_v2-2" }.map { $0.agent == .opencode2 && $0.phase == .running && $0.parentID == "ses_v2-1" } ?? false
+    })
+    assert(latest.first { $0.id == "ses_v2-2" }?.nickname == "explore")
+    assert(latest.first { $0.id == "ses_v2-2" }?.title == "explore the repo")
+    assert(
+        groupActivities(latest).first { $0.root.id == "ses_v2-1" }?.children.map(\.id) == ["ses_v2-2"]
+    )
+
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m7', 'ses_v2-1', 'assistant', 7, \(nowMs + 8900), \(nowMs + 8900), '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"text","text":"stopping"}],"time":{"created":\(nowMs + 8900),"completed":\(nowMs + 9000)},"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 9000) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .stopped })
+
+    // v2 ask flow: the question tool parks the turn on the user, then clears on answer
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m8', 'ses_v2-1', 'user', 8, \(nowMs + 9200), \(nowMs + 9200), '{"text":"one more thing","time":{"created":\(nowMs + 9200)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m9', 'ses_v2-1', 'assistant', 9, \(nowMs + 9300), \(nowMs + 9300), '{"model":{"id":"glm-5.3"},"content":[{"type":"tool","id":"call_v2_ask1","name":"question","time":{"created":\(nowMs - 8000),"ran":\(nowMs - 8000)},"state":{"status":"running","input":{"questions":[{"question":"Ship to prod?"}]}}}],"time":{"created":\(nowMs + 9300)}}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 9300) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 4) {
+        latest.first { $0.id == "ses_v2-1" }.map {
+            $0.phase == .running && $0.prompt?.kind == .question && $0.prompt?.text == "Ship to prod?"
+        } ?? false
+    })
+    assert(askings.filter { $0.id == "ses_v2-1" && $0.prompt?.callID == "call_v2_ask1" }.count == 1)
+    opencodeExecute("""
+    UPDATE session_message SET data = '{"model":{"id":"glm-5.3"},"content":[{"type":"tool","id":"call_v2_ask1","name":"question","time":{"created":\(nowMs - 8000),"ran":\(nowMs - 8000),"completed":\(nowMs + 9400)},"state":{"status":"completed","input":{"questions":[{"question":"Ship to prod?"}]},"content":[{"type":"text","text":"yes"}],"output":"User has answered your questions."}}],"time":{"created":\(nowMs + 9300),"completed":\(nowMs + 9400)},"finish":"stop"}', time_updated = \(nowMs + 9400) WHERE id = 'v2m9';
+    UPDATE session_v2 SET time_updated = \(nowMs + 9400) WHERE id = 'ses_v2-1';
+    """)
+    assert(waitUntil(timeout: 4) {
+        let v2 = latest.first { $0.id == "ses_v2-1" }
+        return v2?.prompt == nil && v2?.phase == .ready
+    })
+
+    // v2 can update messages without advancing session_v2.time_updated.
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m10', 'ses_v2-1', 'user', 10, \(nowMs + 10000), \(nowMs + 10000), '{"text":"stale session row","time":{"created":\(nowMs + 10000)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2m11', 'ses_v2-1', 'assistant', 11, \(nowMs + 10100), \(nowMs + 10100), '{"model":{"id":"glm-5.3"},"content":[{"type":"text","text":"working"}],"time":{"created":\(nowMs + 10100)}}');
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .running })
+    opencodeExecute("""
+    UPDATE session_message SET data = '{"model":{"id":"glm-5.3"},"content":[{"type":"text","text":"finished"}],"time":{"created":\(nowMs + 10100),"completed":\(nowMs + 10200)},"finish":"stop"}', time_updated = \(nowMs + 10200) WHERE id = 'v2m11';
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .ready })
+
+    // the same session id in both schema generations stays distinct
+    opencodeExecute("""
+    INSERT INTO session_v2 (id, parent_id, title, directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived)
+    VALUES ('ses_oc-1', NULL, 'Duplicate ID', '/tmp/workspace', 'build', '{"id":"gpt-5.1"}', 0, 0, 0, 0, 0, 0, \(nowMs + 9500), \(nowMs + 9500), NULL);
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('oc2dup1', 'ses_oc-1', 'user', 1, \(nowMs + 9500), \(nowMs + 9500), '{"text":"dup","time":{"created":\(nowMs + 9500)}}');
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('oc2dup2', 'ses_oc-1', 'assistant', 2, \(nowMs + 9600), \(nowMs + 9600), '{"model":{"id":"gpt-5.1"},"content":[{"type":"text","text":""}],"time":{"created":\(nowMs + 9600)}}');
+    UPDATE session_v2 SET time_updated = \(nowMs + 9600) WHERE id = 'ses_oc-1';
+    """)
+    assert(waitUntil(timeout: 3) {
+        let duplicate = latest.filter { $0.id == "ses_oc-1" }
+        return duplicate.contains { $0.agent == .opencode } && duplicate.contains { $0.agent == .opencode2 }
+    })
+    let duplicateGroups = groupActivities(latest).filter { $0.root.id == "ses_oc-1" }
+    assert(Set(duplicateGroups.map { activityUIIdentity($0.root) }) == Set(["opencode:ses_oc-1", "opencode2:ses_oc-1"]))
+
+    // channel-specific database from a local build (e.g. `ocfix` writing
+    // opencode-<channel>.db) is picked up without a restart.
+    let ocChannelDB = ocData.appendingPathComponent("opencode-pr-48918.db")
+    opencodeExecute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, title text NOT NULL, directory text NOT NULL, agent text, model text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL, tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer); CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL); CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);", at: ocChannelDB)
+    opencodeExecute("""
+    INSERT INTO session (id, parent_id, title, directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived)
+    VALUES ('ses_oc-fix', NULL, 'Local build turn', '/tmp/workspace', 'build', '{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"}', 0, 10, 5, 0, 0, 0, \(nowMs + 11000), \(nowMs + 11100), NULL);
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('mfix1', 'ses_oc-fix', \(nowMs + 11000), \(nowMs + 11000), '{"role":"user","time":{"created":\(nowMs + 11000)}}');
+    INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('pfix1', 'mfix1', 'ses_oc-fix', \(nowMs + 11000), \(nowMs + 11000), '{"type":"text","text":"fix from the local build"}');
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('mfix2', 'ses_oc-fix', \(nowMs + 11100), \(nowMs + 11100), '{"role":"assistant","modelID":"glm-5.3","variant":"high","time":{"created":\(nowMs + 11100)}}');
+    """, at: ocChannelDB)
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "ses_oc-fix" }.map { $0.agent == .opencode && $0.phase == .running } ?? false
+    })
+    assert(latest.first { $0.id == "ses_oc-fix" }?.title == "Local build turn")
+
+    // auto "New session - <timestamp>" titles fall back to the user message.
+    opencodeExecute("""
+    INSERT INTO session (id, parent_id, title, directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived)
+    VALUES ('ses_oc-auto', NULL, 'New session - 2026-09-15T07:44:54.967Z', '/tmp/workspace', 'build', NULL, 0, 10, 5, 0, 0, 0, \(nowMs + 12000), \(nowMs + 12100), NULL);
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('mauto1', 'ses_oc-auto', \(nowMs + 12000), \(nowMs + 12000), '{"role":"user","time":{"created":\(nowMs + 12000)}}');
+    INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('pauto1', 'mauto1', 'ses_oc-auto', \(nowMs + 12000), \(nowMs + 12000), '{"type":"text","text":"how do titles work here"}');
+    INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('mauto2', 'ses_oc-auto', \(nowMs + 12100), \(nowMs + 12100), '{"role":"assistant","modelID":"glm-5.3","time":{"created":\(nowMs + 12100)}}');
+    """)
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "ses_oc-auto" }.map { $0.title == "how do titles work here" } ?? false
+    })
     ocMonitor.stop()
     try? FileManager.default.removeItem(at: ocRoot)
     try? FileManager.default.removeItem(at: emptyDataHome)
+    runClaudeSelfTest()
     print("Session monitor: OK")
+}
+
+private func runClaudeSelfTest() {
+    func record(_ fields: [String: Any], sessionID: String = "claude-test", entrypoint: String = "cli") -> Data {
+        let defaults: [String: Any] = ["sessionId": sessionID, "cwd": "/tmp/workspace",
+            "entrypoint": entrypoint, "timestamp": claudeTimestamp.string(from: Date())]
+        return try! JSONSerialization.data(withJSONObject: defaults.merging(fields) { _, value in value }) + Data([0x0A])
+    }
+    let user = record(["type": "user", "message": ["role": "user", "content": "hello from Claude"]])
+    let tool = record(["type": "assistant", "message": ["id": "msg-1", "model": "claude-sonnet-4-6",
+        "stop_reason": "tool_use", "content": [["type": "tool_use", "id": "read-1", "name": "Read", "input": [:]]],
+        "usage": ["input_tokens": 100, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 10, "output_tokens": 5]]])
+    let toolUpdated = record(["type": "assistant", "message": ["id": "msg-1", "model": "claude-sonnet-4-6",
+        "stop_reason": "tool_use", "content": [["type": "text", "text": "Reading files."]],
+        "usage": ["input_tokens": 100, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 10, "output_tokens": 8]]])
+    let done = record(["type": "assistant", "message": ["id": "msg-2", "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn", "content": [["type": "text", "text": "All done."]],
+        "usage": ["input_tokens": 200, "cache_read_input_tokens": 30, "output_tokens": 10]]])
+    let thinking = record(["type": "assistant", "message": ["id": "msg-2", "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn", "content": [["type": "thinking", "thinking": ""]],
+        "usage": ["input_tokens": 200, "cache_read_input_tokens": 30, "output_tokens": 10]]])
+    let duration = record(["type": "system", "subtype": "turn_duration", "durationMs": 100])
+    let ask = record(["type": "assistant", "message": ["id": "msg-ask", "stop_reason": "tool_use",
+        "content": [["type": "tool_use", "id": "ask-1", "name": "AskUserQuestion",
+                     "input": ["questions": [["question": "Which framework?"]]]]]]])
+    let answer = record(["type": "user", "message": ["role": "user",
+        "content": [["type": "tool_result", "tool_use_id": "ask-1", "content": "SwiftUI"]]]])
+    let plan = record(["type": "assistant", "message": ["stop_reason": "tool_use",
+        "content": [["type": "tool_use", "id": "plan-1", "name": "ExitPlanMode", "input": ["plan": "Build it."]]]]])
+    let interrupted = record(["type": "user", "message": ["role": "user", "content": "[Request interrupted by user]"]])
+    let cost = record(["type": "cost-state", "totalCostUSD": 0.04])
+
+    var state = ClaudeSessionState()
+    assert(!state.consume(Data("broken json".utf8)))
+    assert(!state.consume(record(["type": "file-history-snapshot"])))
+    assert(state.consume(user) && state.event == .started && state.prompt == "hello from Claude")
+    assert(!state.consume(record(["type": "user", "isMeta": true, "message": ["content": "system reminder"]])))
+    assert(!state.consume(record(["type": "user", "isCompactSummary": true, "message": ["content": "old summary"]])))
+    assert(!state.consume(record(["type": "user", "message": ["content": "<local-command-stdout>model changed</local-command-stdout>"]])))
+    assert(state.prompt == "hello from Claude")
+    state.consume(tool)
+    state.consume(toolUpdated)
+    state.consume(toolUpdated)
+    assert(state.event == .started && state.pending.isEmpty && state.usage?.totalTokens == 138)
+    state.consume(ask)
+    assert(state.pending["ask-1"]?.text == "Which framework?" && state.pending["ask-1"]?.kind == .question)
+    state.consume(answer)
+    assert(state.pending.isEmpty && state.event == .started && state.prompt == "hello from Claude")
+    state.consume(plan)
+    assert(state.pending["plan-1"]?.kind == .permission)
+    state.consume(interrupted)
+    state.consume(duration)
+    assert(state.event == .cancelled && state.pending.isEmpty)
+    state.consume(user)
+    state.consume(thinking)
+    assert(state.event == .started && state.response == nil)
+    state.consume(record(["type": "assistant", "message": ["content": [["type": "text", "text": "Finished."]], "stop_reason": NSNull()]]))
+    assert(state.event == .started)
+    state.consume(duration)
+    assert(state.event == .completed)
+    state.consume(done)
+    state.consume(cost)
+    assert(state.usage?.totalTokens == 378 && state.usage?.contextTokens == 240 && state.usage?.costTotal == 0.04)
+    assert(state.model == "claude-sonnet-4-6")
+    state.consume(record(["type": "assistant", "isApiErrorMessage": true, "message": ["model": "<synthetic>", "content": "API error"]]))
+    assert(state.event == .cancelled && state.model == "claude-sonnet-4-6")
+    assert(claudeSource("claude-desktop") == "desktop" && claudeSource("claude-vscode") == "extension")
+    assert(agentRowLabel(.claude) == "claude")
+    assert(shouldMarkStopped(.running, updatedAt: Date().addingTimeInterval(-claudeRunningInactivityTimeout - 1), timeout: claudeRunningInactivityTimeout))
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-claude-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    setenv("CLAUDE_CONFIG_DIR", root.path, 1)
+    let project = root.appendingPathComponent("projects/-tmp-workspace", isDirectory: true)
+    let children = project.appendingPathComponent("claude-test/subagents", isDirectory: true)
+    try! FileManager.default.createDirectory(at: children, withIntermediateDirectories: true)
+    let cliFile = project.appendingPathComponent("claude-test.jsonl")
+    let desktopFile = project.appendingPathComponent("desktop-test.jsonl")
+    let childFile = children.appendingPathComponent("agent-child.jsonl")
+    let split = tool.count / 2
+    let header = Data(#"{"type":"mode","mode":"normal","sessionId":"claude-test"}"#.utf8) + Data([0x0A])
+    try! (header + user + tool.prefix(split)).write(to: cliFile)
+    let desktopUser = record(["type": "user", "message": ["role": "user", "content": "Desktop task"]], sessionID: "desktop-test", entrypoint: "claude-desktop")
+    let desktopDone = record(["type": "assistant", "message": ["stop_reason": "end_turn", "content": "Desktop done."]], sessionID: "desktop-test", entrypoint: "claude-desktop")
+    try! (desktopUser + desktopDone).write(to: desktopFile)
+    try! record(["type": "user", "isSidechain": true, "agentId": "child", "message": ["content": "Explore files"]]).write(to: childFile)
+    let stale = record(["type": "assistant", "timestamp": claudeTimestamp.string(from: Date().addingTimeInterval(-activityRetention - 10)), "message": ["stop_reason": "end_turn"]], sessionID: "stale")
+    try! (record(["type": "user", "timestamp": claudeTimestamp.string(from: Date().addingTimeInterval(-activityRetention - 20)), "message": ["content": "Old task"]], sessionID: "stale") + stale)
+        .write(to: project.appendingPathComponent("stale.jsonl"))
+
+    var latest: [ThreadActivity] = []
+    var completions: [ThreadActivity] = []
+    var askings: [ThreadActivity] = []
+    let monitor = SessionMonitor()
+    monitor.onChange = { activities, _, _ in latest = activities }
+    monitor.onCompletion = { completions.append($0) }
+    monitor.onAsking = { askings.append($0) }
+    monitor.start()
+    assert(waitUntil(timeout: 3) {
+        latest.contains { $0.id == "claude-test" && $0.phase == .running && $0.usage == nil }
+            && latest.contains { $0.id == "desktop-test" && $0.phase == .ready && $0.source == "desktop" }
+            && latest.contains { $0.parentID == "claude-test" }
+    }, "Claude bootstrap: \(latest.map { "\($0.key) \($0.phase) \($0.source) parent=\($0.parentID ?? "none")" })")
+    assert(!latest.contains { $0.id == "stale" })
+    assert(completions.isEmpty && askings.isEmpty)
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.count == 1)
+    assert(latest.first { $0.id == "claude-test" }?.project == "workspace")
+
+    func append(_ data: Data, to file: URL = cliFile) {
+        let handle = try! FileHandle(forWritingTo: file)
+        try! handle.seekToEnd()
+        try! handle.write(contentsOf: data)
+        try! handle.close()
+    }
+    append(Data(tool.dropFirst(split)) + toolUpdated + toolUpdated + ask)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.prompt?.text == "Which framework?" })
+    assert(latest.first { $0.id == "claude-test" }?.usage?.totalTokens == 138)
+    assert(askings.filter { $0.id == "claude-test" }.count == 1)
+    append(answer + thinking)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.usage?.totalTokens == 378 })
+    assert(latest.first { $0.id == "claude-test" }?.phase == .running && completions.isEmpty)
+    append(done + duration + cost)
+    append(done, to: childFile)
+    assert(waitUntil(timeout: 3) {
+        latest.first { $0.id == "claude-test" }?.phase == .ready
+            && latest.first { $0.parentID == "claude-test" }?.phase == .ready
+            && completions.count == 1
+    })
+    let finished = latest.first { $0.id == "claude-test" }
+    assert(finished?.agent == .claude && finished?.source == "cli" && finished?.detail == "All done.")
+    assert(finished?.prompt == nil && finished?.usage?.totalTokens == 378)
+    assert(agentUsageSummary([finished!], agent: .claude) == "claude 378 tok · $0.04")
+    monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
+    assert(waitUntil { latest.first { $0.id == "claude-test" }?.phase == .seen })
+    assert(latest.first { $0.id == "desktop-test" }?.phase == .ready)
+    append(record(["type": "custom-title", "customTitle": "Named session"]) + cost)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.title == "Named session" })
+    assert(latest.first { $0.id == "claude-test" }?.phase == .seen)
+    monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["desktop"])
+    assert(waitUntil { latest.first { $0.id == "desktop-test" }?.phase == .seen })
+    let desktopAsk = record(["type": "assistant", "message": ["content": [["type": "tool_use", "id": "desktop-ask", "name": "AskUserQuestion", "input": [:]]]]], sessionID: "desktop-test", entrypoint: "claude-desktop")
+    let desktopInterrupted = record(["type": "user", "message": ["content": "[Request interrupted by user]"]], sessionID: "desktop-test", entrypoint: "claude-desktop")
+    append(desktopUser + desktopAsk + desktopInterrupted, to: desktopFile)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "desktop-test" }?.phase == .stopped })
+    assert(latest.first { $0.id == "desktop-test" }?.prompt == nil)
+    assert(latest.first { $0.id == "desktop-test" }?.source == "desktop")
+    monitor.stop()
+
+    let replay = SessionMonitor()
+    replay.onChange = { activities, _, _ in latest = activities }
+    replay.onCompletion = { _ in assertionFailure("Historical completion notified") }
+    replay.onAsking = { _ in assertionFailure("Resolved historical question notified") }
+    latest = []
+    replay.start()
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.usage?.totalTokens == 378 })
+    try! (header + user).write(to: cliFile)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }.map { $0.phase == .running && $0.usage == nil } ?? false })
+    let newFile = project.appendingPathComponent("new-session.jsonl")
+    try! record(["type": "user", "message": ["content": "New session"]], sessionID: "new-test").write(to: newFile)
+    assert(waitUntil(timeout: 3) { latest.contains { $0.id == "new-test" && $0.phase == .running } })
+    replay.stop()
 }
 
 private func waitUntil(timeout: TimeInterval = 1, _ condition: () -> Bool) -> Bool {
