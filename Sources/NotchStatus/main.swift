@@ -2957,6 +2957,23 @@ private enum Palette {
     static let mutedInk = NSColor(white: 0.29, alpha: 1)
 }
 
+private func notificationWarning(
+    authorization: UNAuthorizationStatus,
+    alerts: UNNotificationSetting,
+    style: UNAlertStyle
+) -> String? {
+    switch authorization {
+    case .notDetermined, .denied:
+        return "Notifications off"
+    case .provisional:
+        return "Banners off"
+    case .authorized:
+        return alerts != .enabled || style == .none ? "Banners off" : nil
+    @unknown default:
+        return nil
+    }
+}
+
 private final class IslandView: NSView {
     var onExpansionChange: ((Bool) -> Void)?
     private(set) var expanded = false
@@ -2969,6 +2986,8 @@ private final class IslandView: NSView {
     private var animationTimer: Timer?
     private var collapseWorkItem: DispatchWorkItem?
     private var disclosureButtons: [String: NSButton] = [:]
+    private let notificationButton = NSButton()
+    private var notificationWarning: String?
     private var expandedGroupIDs = Set<String>()
     private var mouthOpen = true
     private var pacmanProgress: CGFloat = 0
@@ -2984,7 +3003,8 @@ private final class IslandView: NSView {
         if !sessions.isEmpty { lines.append((nil, sessions)) }
         return lines
     }
-    private var footerHeight: CGFloat { CGFloat(footerLines.count) * 15 + 11 }
+    private var notificationWarningHeight: CGFloat { notificationWarning == nil ? 0 : 26 }
+    private var footerHeight: CGFloat { CGFloat(footerLines.count) * 15 + 11 + notificationWarningHeight }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -2992,9 +3012,26 @@ private final class IslandView: NSView {
         setAccessibilityRole(.group)
         setAccessibilityLabel("Agent status")
         setAccessibilityHelp("Hover or click to show Codex, Pi, opencode, opencode2 and Claude session details, including pending questions and permission asks")
+        notificationButton.target = self
+        notificationButton.action = #selector(openNotificationSettings(_:))
+        notificationButton.isBordered = false
+        notificationButton.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        notificationButton.contentTintColor = Palette.pacYellow
+        notificationButton.image = NSImage(systemSymbolName: "bell.slash", accessibilityDescription: nil)
+        notificationButton.imageHugsTitle = true
+        notificationButton.isHidden = true
+        addSubview(notificationButton)
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func setNotificationWarning(_ warning: String?) {
+        guard notificationWarning != warning else { return }
+        notificationWarning = warning
+        layoutNotificationButton()
+        updateAccessibilityValue()
+        needsDisplay = true
+    }
 
     func update(activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot? = nil) {
         let previousGroups = Set(groupActivities(self.activities).filter { !$0.children.isEmpty }.map { $0.root.key })
@@ -3035,6 +3072,7 @@ private final class IslandView: NSView {
             collapseWorkItem = nil
         }
         syncDisclosureButtons()
+        layoutNotificationButton()
         needsDisplay = true
         onExpansionChange?(value)
     }
@@ -3107,6 +3145,30 @@ private final class IslandView: NSView {
     override func layout() {
         super.layout()
         syncDisclosureButtons()
+        layoutNotificationButton()
+    }
+
+    private func layoutNotificationButton() {
+        notificationButton.isHidden = notificationWarning == nil
+        guard let warning = notificationWarning else { return }
+        notificationButton.title = "\(warning) · Open settings ↗"
+        notificationButton.imagePosition = expanded ? .imageLeft : .imageOnly
+        notificationButton.setAccessibilityLabel("\(warning). Open notification settings")
+        notificationButton.toolTip = "Enable notifications and banners for notchtail in System Settings to receive task and attention alerts."
+        let bodyRight = bounds.maxX - bodyInset
+        notificationButton.frame = expanded
+            ? NSRect(x: bounds.minX + bodyInset + 12, y: footerHeight - notificationWarningHeight,
+                width: bounds.width - 2 * bodyInset - 24, height: notificationWarningHeight)
+            : NSRect(x: bodyRight - 32, y: bounds.maxY - topBandHeight / 2 - 12, width: 24, height: 24)
+    }
+
+    @objc private func openNotificationSettings(_ sender: Any?) {
+        let identifier = Bundle.main.bundleIdentifier ?? "app.notchtail"
+        let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(identifier)")!
+        if !NSWorkspace.shared.open(url) {
+            NSLog("Unable to open notification settings")
+            NSSound.beep()
+        }
     }
 
     var visibleRowCount: Int { visibleRows.count }
@@ -3217,6 +3279,11 @@ private final class IslandView: NSView {
             font: .monospacedSystemFont(ofSize: 13, weight: .bold),
             color: runningCount > 0 ? Palette.phosphor : Palette.tertiaryInk
         )
+
+        if let warning = notificationWarning {
+            setAccessibilityHelp("\(warning). Expand the island to open notification settings")
+            return
+        }
 
         if let prompting = activities.first(where: { $0.prompt != nil }) {
             drawAgentSprite(
@@ -3379,7 +3446,7 @@ private final class IslandView: NSView {
         for (index, line) in lines.enumerated() {
             let textWidth = (line.text as NSString).size(withAttributes: [.font: font]).width
             let iconX = max(bodyLeft + 12, (bodyLeft + bodyRight - textWidth - 18) / 2).rounded(.down)
-            let y = footerHeight - CGFloat(index + 1) * 15
+            let y = footerHeight - notificationWarningHeight - CGFloat(index + 1) * 15
             if let agent = line.agent {
                 drawAgentSprite(agent: agent, at: NSPoint(x: iconX + 5.25, y: y + 6.75), pixel: 1.5,
                     color: agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk, running: false)
@@ -3664,12 +3731,14 @@ private final class IslandView: NSView {
             guard count > 0, let label = agentRowLabel(agent) else { return nil }
             return "\(label) \(count)"
         }.joined(separator: ", ")
+        let notificationSummary = notificationWarning.map { ", \($0). Open notification settings to enable banners" } ?? ""
         setAccessibilityValue(
             "\(asking) asking, \(running) running, \(delegating) delegating, \(ready) ready, \(stopped) stopped, \(seen) seen"
                 + (agentCounts.isEmpty ? "" : ", \(agentCounts)")
                 + groups.filter { !$0.children.isEmpty }.map { ", \($0.root.title): \($0.subagentSummary)" }.joined()
                 + ", \(remainingUsageSummary(accountUsage).replacingOccurrences(of: "↻", with: "resets"))"
                 + ", \(remainingUsageSummary(claudeUsage, agent: .claude).replacingOccurrences(of: "↻", with: "resets"))"
+                + notificationSummary
         )
     }
 }
@@ -3680,6 +3749,7 @@ private final class IslandPanel: NSPanel {
 }
 
 private final class IslandController {
+    var onExpansion: (() -> Void)?
     private let panel: IslandPanel
     private let island: IslandView
     private var outsideClickMonitor: Any?
@@ -3700,7 +3770,10 @@ private final class IslandController {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
 
-        island.onExpansionChange = { [weak self] _ in self?.resize(animated: true) }
+        island.onExpansionChange = { [weak self] expanded in
+            self?.resize(animated: true)
+            if expanded { self?.onExpansion?() }
+        }
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
@@ -3721,6 +3794,11 @@ private final class IslandController {
 
     func update(_ activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot?) {
         island.update(activities: activities, accountUsage: accountUsage, claudeUsage: claudeUsage)
+        resize(animated: true)
+    }
+
+    func setNotificationWarning(_ warning: String?) {
+        island.setNotificationWarning(warning)
         resize(animated: true)
     }
 
@@ -3796,12 +3874,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
     func applicationDidFinishLaunching(_ notification: Notification) {
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
-        notifications.requestAuthorization(options: [.alert, .sound]) { _, error in
+        notifications.requestAuthorization(options: [.alert, .sound]) { [weak self] _, error in
             if let error { NSLog("Notification authorization failed: %@", error.localizedDescription) }
+            self?.refreshNotificationSettings()
         }
 
         let island = IslandController()
         self.island = island
+        island.onExpansion = { [weak self] in self?.refreshNotificationSettings() }
+        refreshNotificationSettings()
         monitor.onChange = { [weak island] activities, usage, claudeUsage in
             island?.update(activities, accountUsage: usage, claudeUsage: claudeUsage)
         }
@@ -3852,6 +3933,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         ) { [weak self] note in
             guard let self,
                   let application = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self.refreshNotificationSettings()
             let plan = acknowledgementPlan(for: application)
             if !plan.isEmpty {
                 self.monitor.acknowledge(
@@ -3863,6 +3945,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             }
         }
         monitor.start()
+    }
+
+    private func refreshNotificationSettings() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let warning = notificationWarning(
+                authorization: settings.authorizationStatus,
+                alerts: settings.alertSetting,
+                style: settings.alertStyle
+            )
+            DispatchQueue.main.async { self?.island?.setNotificationWarning(warning) }
+        }
     }
 
     func userNotificationCenter(
@@ -3879,6 +3972,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
 }
 
 private func runSelfTest() {
+    assert(notificationWarning(authorization: .denied, alerts: .disabled, style: .none) == "Notifications off")
+    assert(notificationWarning(authorization: .notDetermined, alerts: .disabled, style: .none) == "Notifications off")
+    assert(notificationWarning(authorization: .authorized, alerts: .disabled, style: .banner) == "Banners off")
+    assert(notificationWarning(authorization: .authorized, alerts: .enabled, style: .none) == "Banners off")
+    assert(notificationWarning(authorization: .provisional, alerts: .enabled, style: .banner) == "Banners off")
+    assert(notificationWarning(authorization: .authorized, alerts: .enabled, style: .banner) == nil)
+    assert(notificationWarning(authorization: .authorized, alerts: .enabled, style: .alert) == nil)
     let started = Data(#"{"type":"event_msg","payload":{"type":"task_started"}}"#.utf8)
     let completed = Data(#"{"type":"event_msg","payload":{"type":"task_complete"}}"#.utf8)
     let cancelled = Data(#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#.utf8)

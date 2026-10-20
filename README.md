@@ -30,7 +30,7 @@ make app
 open dist/notchtail.app
 ```
 
-Allow notifications for **notchtail** when prompted. Upgrading from NotchStatus asks again because the renamed app has its own notification identity.
+Allow notifications for **notchtail** when prompted. Upgrading from NotchStatus asks again because the renamed app has its own notification identity. If permission or banners are disabled, the collapsed island shows a yellow crossed-out bell. Expand it and select **Open settings** to enable notifications for notchtail. The warning refreshes when you open the island or switch apps and disappears once banners are enabled.
 
 The app has no Dock icon. Click the island or outside it to close; right-click it to quit.
 
