@@ -510,8 +510,10 @@ private struct ClaudeSessionState {
     var source: String?
     var updatedAt: Date?
     var pending: [String: AgentPrompt] = [:]
+    var subagentNames: [String: String] = [:]
     private var customName: String?
     private var generatedName: String?
+    private var handbacks: [String: String] = [:]
     private var messageTokens: [String: Int] = [:]
     private var totalTokens = 0
     private var contextTokens = 0
@@ -539,14 +541,30 @@ private struct ClaudeSessionState {
         switch type {
         case "user":
             let results = blocks.filter { ($0["type"] as? String) == "tool_result" }
+            var deliveredReport: String?
             for result in results {
-                if let id = result["tool_use_id"] as? String { pending.removeValue(forKey: id) }
+                guard let id = result["tool_use_id"] as? String else { continue }
+                pending.removeValue(forKey: id)
+                if let report = handbacks.removeValue(forKey: id), result["is_error"] as? Bool != true {
+                    let status = piTextContent(result["content"]).flatMap { $0.data(using: .utf8) }
+                        .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                    if status?["success"] as? Bool == true { deliveredReport = report }
+                }
+            }
+            if let result = object["toolUseResult"] as? [String: Any],
+               let agentID = result["agentId"] as? String, let sessionID = object["sessionId"] as? String,
+               let name = condensedText(result["description"] as? String ?? "") {
+                subagentNames["\(sessionID):agent:\(agentID)"] = name
             }
             let interrupted = (object["toolUseResult"] as? [String: Any])?["interrupted"] as? Bool == true
                 || text?.hasPrefix("[Request interrupted by user") == true
             if interrupted {
                 event = .cancelled
                 pending.removeAll()
+                handbacks.removeAll()
+            } else if let deliveredReport, event != .cancelled {
+                event = .completed
+                response = condensedText(deliveredReport)
             } else if !results.isEmpty {
                 if event != .cancelled { event = .started }
             } else {
@@ -560,6 +578,7 @@ private struct ClaudeSessionState {
                 if !taskNotification, let text { prompt = text }
                 response = nil
                 pending.removeAll()
+                handbacks.removeAll()
                 event = .started
             }
         case "assistant":
@@ -576,9 +595,14 @@ private struct ClaudeSessionState {
                 contextTokens = count
             }
             for block in blocks where block["type"] as? String == "tool_use" {
-                guard let id = block["id"] as? String, let tool = block["name"] as? String,
-                      tool == "AskUserQuestion" || tool == "ExitPlanMode" else { continue }
+                guard let id = block["id"] as? String, let tool = block["name"] as? String else { continue }
                 let input = block["input"] as? [String: Any] ?? [:]
+                if tool == "SubagentHandback" { handbacks[id] = input["message"] as? String ?? "" }
+                if tool != "SubagentHandback" && tool != "AskUserQuestion" && tool != "ExitPlanMode" {
+                    let detail = condensedText(input["description"] as? String ?? "") ?? condensedText(promptText(tool: tool, input: input))
+                    response = detail.map { "\(tool): \($0)" } ?? tool
+                }
+                guard tool == "AskUserQuestion" || tool == "ExitPlanMode" else { continue }
                 let question = (input["questions"] as? [[String: Any]])?.first?["question"] as? String
                 pending[id] = AgentPrompt(kind: tool == "AskUserQuestion" ? .question : .permission,
                     tool: tool, text: condensedText(question ?? input["plan"] as? String ?? "") ?? "", callID: id)
@@ -910,7 +934,7 @@ private func promptText(tool: String, input: [String: Any]) -> String {
         let text = questions.compactMap { $0["question"] as? String }.first { !$0.isEmpty }
         if let text { return String(text.prefix(160)) }
     }
-    for key in ["command", "filePath", "path", "pattern", "url"] {
+    for key in ["command", "filePath", "file_path", "path", "pattern", "url"] {
         if let value = input[key] as? String, !value.isEmpty {
             return String(value.prefix(160))
         }
@@ -1040,6 +1064,7 @@ private final class SessionMonitor {
     private var opencodeTitles: [String: String] = [:]
     private var agentPrompts: [String: AgentPrompt] = [:]
     private var promptedIDs: Set<String> = []
+    private var pendingCompletions: Set<String> = []
     private var opencodeAskingEvents: [OpencodeAskingEvent] = []
     private var opencodeLogOffset: UInt64 = 0
     private var opencodeLogLoaded = false
@@ -1124,6 +1149,7 @@ private final class SessionMonitor {
     func stop() {
         queue.sync { [self] in
             active = false
+            pendingCompletions.removeAll()
             generation &+= 1
             lifecycleLock.lock()
             lifecycleGeneration = generation
@@ -1150,7 +1176,8 @@ private final class SessionMonitor {
     func acknowledge(codexSources: Set<String>, piSources: Set<String>, opencodeSources: Set<String>, claudeSources: Set<String> = []) {
         queue.async { [self] in
             var changed = false
-            for (key, var activity) in activities where activity.phase == .ready {
+            let workingParents = Set(groupActivities(Array(activities.values)).filter { $0.phase == .delegating }.map { $0.root.key })
+            for (key, var activity) in activities where activity.phase == .ready && !workingParents.contains(key) {
                 let sources: Set<String>
                 switch activity.agent {
                 case .pi: sources = piSources
@@ -1554,7 +1581,7 @@ private struct OpencodeSessionRow {
 
         if previousPhase == .running, phase == .ready, meta.parentID == nil {
             let completed = activity(for: meta, phase: .ready, at: row.updatedAt)
-            dispatchCompletion(completed)
+            pendingCompletions.insert(completed.key)
         }
 
         if phase != .running { agentPrompts.removeValue(forKey: key) }
@@ -1576,9 +1603,6 @@ private struct OpencodeSessionRow {
         }
         if !row.title.isEmpty, !isOpencodeDefaultTitle(row.title) { opencodeTitles[key] = row.title }
 
-        guard shouldRetain(phase, updatedAt: row.updatedAt) else {
-            return activities.removeValue(forKey: key) != nil
-        }
         activities[key] = activity(for: meta, phase: phase, at: row.updatedAt)
         return true
     }
@@ -1907,8 +1931,6 @@ private struct OpencodeSessionRow {
         case .completed: phase = .ready
         case .cancelled: phase = .stopped
         }
-        guard shouldRetain(phase, updatedAt: modifiedAt) else { return false }
-
         activities[key] = activity(for: meta, phase: phase, at: modifiedAt)
         if let prompt = agentPrompts[key], !promptedIDs.contains(prompt.callID) {
             promptedIDs.insert(prompt.callID)
@@ -2013,7 +2035,7 @@ private struct OpencodeSessionRow {
                     agentPrompts.removeValue(forKey: cursor.meta.key)
                     let completed = activity(for: cursor.meta, phase: .ready, at: Date())
                     if activities[cursor.meta.key]?.phase == .running, cursor.meta.parentID == nil {
-                        dispatchCompletion(completed)
+                        pendingCompletions.insert(completed.key)
                     }
                     activities[cursor.meta.key] = completed
                 case .cancelled:
@@ -2036,6 +2058,7 @@ private struct OpencodeSessionRow {
         let key = meta.key
         let previousEvent = claudeSessions[key]?.event
         let previousDate = claudeSessions[key]?.updatedAt
+        let previousNames = claudeSessions[key]?.subagentNames ?? [:]
         guard claudeSessions[key, default: ClaudeSessionState()].consume(line),
               let state = claudeSessions[key] else { return false }
         if let source = state.source { meta.source = source }
@@ -2058,14 +2081,18 @@ private struct OpencodeSessionRow {
             case .cancelled: phase = .stopped
             }
         }
-        guard shouldRetain(phase, updatedAt: date) else {
-            return activities.removeValue(forKey: key) != nil
-        }
         let updated = activity(for: meta, phase: phase, at: date)
         activities[key] = updated
+        if state.subagentNames != previousNames {
+            for cursor in cursors.values where cursor.meta.agent == .claude && cursor.meta.parentID == meta.id {
+                if let child = activities[cursor.meta.key] {
+                    activities[child.key] = activity(for: cursor.meta, phase: child.phase, at: child.updatedAt)
+                }
+            }
+        }
         if notify {
             if previous?.phase == .running, phase == .ready, meta.parentID == nil {
-                dispatchCompletion(updated)
+                pendingCompletions.insert(updated.key)
             }
             if let prompt = updated.prompt, promptedIDs.insert("\(key):\(prompt.callID)").inserted {
                 dispatchAsking(updated)
@@ -2107,7 +2134,7 @@ private struct OpencodeSessionRow {
                 agentPrompts.removeValue(forKey: key)
                 let completed = activity(for: meta, phase: .ready, at: Date())
                 if activities[key]?.phase == .running {
-                    dispatchCompletion(completed)
+                    pendingCompletions.insert(completed.key)
                 }
                 activities[key] = completed
             case "aborted", "error":
@@ -2375,7 +2402,7 @@ private struct OpencodeSessionRow {
                 let agentID = object["agentId"] as? String
                     ?? file.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "agent-", with: "")
                 return SessionMeta(id: isChild ? "\(sessionID):agent:\(agentID)" : sessionID, agent: .claude,
-                    parentID: isChild ? sessionID : nil, nickname: isChild ? agentID : nil,
+                    parentID: isChild ? sessionID : nil, nickname: nil,
                     source: claudeSource(object["entrypoint"] as? String ?? "cli"),
                     project: URL(fileURLWithPath: cwd).lastPathComponent)
             }
@@ -2495,7 +2522,9 @@ private struct OpencodeSessionRow {
         let title: String?
         switch meta.agent {
         case .codex: title = titles[meta.id] ?? prompts[meta.key]
-        case .claude: title = claudeSessions[meta.key]?.name ?? prompts[meta.key]
+        case .claude:
+            title = meta.parentID.flatMap { claudeSessions["claude:\($0)"]?.subagentNames[meta.id] }
+                ?? claudeSessions[meta.key]?.name ?? prompts[meta.key]
         case .pi: title = prompts[meta.key] ?? piSessionNames[meta.key]
         case .opencode, .opencode2: title = opencodeTitles[meta.key] ?? prompts[meta.key]
         }
@@ -2631,13 +2660,24 @@ private struct OpencodeSessionRow {
 
     private func publish() {
         let now = Date()
-        activities = activities.filter { shouldRetain($0.value.phase, updatedAt: $0.value.updatedAt, now: now) }
+        let groups = groupActivities(Array(activities.values))
+        for group in groups where !group.children.isEmpty && group.root.phase != .running {
+            activities[group.root.key]?.updatedAt = group.updatedAt
+            if group.phase == .delegating && group.root.phase == .ready { pendingCompletions.insert(group.root.key) }
+        }
+        let workingGroups = groups.filter { $0.phase == .running || $0.phase == .delegating || $0.asking }
+        let workingKeys = Set(workingGroups.flatMap { [$0.root.key] + $0.children.map(\.key) })
+        activities = activities.filter { workingKeys.contains($0.key) || shouldRetain($0.value.phase, updatedAt: $0.value.updatedAt, now: now) }
         let liveKeys = Set(activities.keys)
         agentPrompts = agentPrompts.filter { liveKeys.contains($0.key) }
         piOpenAsks = piOpenAsks.filter { liveKeys.contains($0.key) }
         refreshCodexAccountUsageIfNeeded()
         refreshClaudeAccountUsageIfNeeded()
-        scheduleExpiry()
+        scheduleExpiry(excluding: workingKeys)
+        pendingCompletions = pendingCompletions.filter { activities[$0]?.phase == .ready }
+        let completed = groupActivities(Array(activities.values)).filter {
+            $0.phase == .ready && pendingCompletions.remove($0.root.key) != nil
+        }.map(\.root)
         let snapshot = activities.values.sorted {
             if ($0.prompt != nil) != ($1.prompt != nil) {
                 return $0.prompt != nil
@@ -2654,6 +2694,7 @@ private struct OpencodeSessionRow {
             guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
             self.onChange?(snapshot, usage, claudeUsage)
         }
+        for activity in completed { dispatchCompletion(activity) }
     }
 
     // Completion callbacks use the same lifecycle boundary as state updates.
@@ -2679,10 +2720,10 @@ private struct OpencodeSessionRow {
         return lifecycleActive && lifecycleGeneration == callbackGeneration
     }
 
-    private func scheduleExpiry() {
+    private func scheduleExpiry(excluding workingKeys: Set<String>) {
         expiryWorkItem?.cancel()
         guard let nextExpiry = activities.values
-            .filter({ $0.phase != .running })
+            .filter({ $0.phase != .running && !workingKeys.contains($0.key) })
             .map({ $0.updatedAt.addingTimeInterval(activityRetention) })
             .min() else { return }
 
@@ -2698,6 +2739,17 @@ private struct ActivityGroup {
     let phase: ThreadPhase
     let updatedAt: Date
     let asking: Bool
+
+    var subagentSummary: String {
+        var parts = ["\(children.count) subagent\(children.count == 1 ? "" : "s")"]
+        for (label, count) in [
+            ("running", children.filter { $0.phase == .running && $0.prompt == nil }.count),
+            ("asking", children.filter { $0.prompt != nil }.count),
+            ("done", children.filter { $0.phase == .ready || $0.phase == .seen }.count),
+            ("stopped", children.filter { $0.phase == .stopped }.count),
+        ] where count > 0 { parts.append("\(count) \(label)") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 private struct ActivityRow {
@@ -2705,6 +2757,7 @@ private struct ActivityRow {
     let phase: ThreadPhase
     let depth: Int
     let childCount: Int
+    var subagentSummary: String? = nil
 }
 
 private func groupActivities(_ activities: [ThreadActivity]) -> [ActivityGroup] {
@@ -2725,14 +2778,16 @@ private func groupActivities(_ activities: [ThreadActivity]) -> [ActivityGroup] 
     let grouped = Dictionary(grouping: activities, by: rootID)
     return grouped.map { key, members in
         let root = byID[key] ?? members.max(by: { $0.updatedAt < $1.updatedAt })!
-        let children = members.filter { $0.id != root.id }.sorted { $0.updatedAt > $1.updatedAt }
+        let children = members.filter { $0.id != root.id }.sorted {
+            if ($0.prompt != nil) != ($1.prompt != nil) { return $0.prompt != nil }
+            if phaseRank($0.phase) != phaseRank($1.phase) { return phaseRank($0.phase) < phaseRank($1.phase) }
+            return $0.updatedAt > $1.updatedAt
+        }
         let childIsRunning = children.contains { $0.phase == .running }
         return ActivityGroup(
             root: root,
             children: children,
-            // A stopped parent with active delegated work is still in progress
-            // as a group, but the parent itself is no longer running.
-            phase: root.phase == .stopped && childIsRunning ? .delegating : root.phase,
+            phase: root.phase != .running && childIsRunning ? .delegating : root.phase,
             updatedAt: members.map(\.updatedAt).max() ?? root.updatedAt,
             asking: members.contains { $0.prompt != nil }
         )
@@ -2882,10 +2937,14 @@ private final class IslandView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func update(activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot? = nil) {
+        let previousGroups = Set(groupActivities(self.activities).filter { !$0.children.isEmpty }.map { $0.root.key })
         self.activities = activities
         self.accountUsage = accountUsage
         self.claudeUsage = claudeUsage
         expandedGroupIDs.formIntersection(groupActivities(activities).map { activityUIIdentity($0.root) })
+        expandedGroupIDs.formUnion(groupActivities(activities).filter {
+            !previousGroups.contains($0.root.key) && $0.children.contains { $0.phase == .running }
+        }.map { $0.root.key })
         syncDisclosureButtons()
         updateAnimationTimer()
         updateAccessibilityValue()
@@ -2999,7 +3058,8 @@ private final class IslandView: NSView {
                 activity: group.root,
                 phase: group.phase,
                 depth: 0,
-                childCount: group.children.count
+                childCount: group.children.count,
+                subagentSummary: group.children.contains { $0.phase == .running } ? group.subagentSummary : nil
             ))
             if expandedGroupIDs.contains(activityUIIdentity(group.root)) {
                 for child in group.children where rows.count < 8 {
@@ -3032,13 +3092,14 @@ private final class IslandView: NSView {
         for (index, row) in rows.enumerated() where row.depth == 0 && row.childCount > 0 {
             let identity = activityUIIdentity(row.activity)
             let button = disclosureButtons[identity]!
-            button.title = "\(expandedGroupIDs.contains(identity) ? "▾" : "▸") \(row.childCount)"
-            button.toolTip = "\(row.childCount) subagent\(row.childCount == 1 ? "" : "s")"
-            button.setAccessibilityLabel(button.toolTip)
+            let isExpanded = expandedGroupIDs.contains(identity)
+            button.title = "\(isExpanded ? "▾" : "▸") \(row.childCount) agent\(row.childCount == 1 ? "" : "s")"
+            button.toolTip = row.subagentSummary ?? "\(row.childCount) subagents"
+            button.setAccessibilityLabel("\(isExpanded ? "Hide" : "Show") \(row.childCount) subagents")
             button.frame = NSRect(
-                x: bodyRight - 116,
+                x: bodyRight - 154,
                 y: bounds.maxY - topBandHeight - CGFloat(index) * rowHeight - 25,
-                width: 46,
+                width: 84,
                 height: 18
             )
             button.isHidden = false
@@ -3191,19 +3252,27 @@ private final class IslandView: NSView {
             let prompt = activity.prompt
             let color = prompt != nil ? Palette.askPink : statusColor(for: row.phase)
             let textX = bodyLeft + 35 + CGFloat(row.depth) * 18
-            let status = prompt != nil ? "ASKING" : statusText(for: row.phase)
+            let status = prompt != nil ? "ASKING" : row.depth > 0 && (row.phase == .ready || row.phase == .seen) ? "DONE" : statusText(for: row.phase)
             let statusWidth: CGFloat = 58
             let statusX = bodyRight - statusWidth - 10
-            let titleRight = row.childCount > 0 ? bodyRight - 122 : status.isEmpty ? bodyRight - 16 : statusX - 4
-            let title = row.depth > 0 ? activity.nickname ?? activity.title : activity.title
+            let titleRight = row.childCount > 0 ? bodyRight - 158 : status.isEmpty ? bodyRight - 16 : statusX - 4
+            let title = activity.title
             let metadata = [
-                agentRowLabel(activity.agent),
-                activity.agent == .claude ? activity.source : nil,
-                String(activity.project.prefix(18)),
+                row.depth > 0 ? activity.nickname : agentRowLabel(activity.agent),
+                row.depth == 0 && activity.agent == .claude ? activity.source : nil,
+                row.depth == 0 ? String(activity.project.prefix(18)) : nil,
                 activity.model,
                 usageSummary(activity.usage),
                 relativeAge(activity.updatedAt),
             ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            if row.depth > 0 {
+                let branch = NSBezierPath()
+                branch.move(to: NSPoint(x: bodyLeft + 16, y: rowTop - 2))
+                branch.line(to: NSPoint(x: bodyLeft + 16, y: centerY))
+                branch.line(to: NSPoint(x: bodyLeft + 25, y: centerY))
+                Palette.mutedInk.setStroke()
+                branch.stroke()
+            }
             drawAgentSprite(
                 agent: activity.agent,
                 at: NSPoint(x: bodyLeft + 16 + CGFloat(row.depth) * 18, y: centerY),
@@ -3214,7 +3283,7 @@ private final class IslandView: NSView {
             drawText(
                 title,
                 in: NSRect(x: textX, y: rowTop - 24, width: max(60, titleRight - textX), height: 16),
-                font: .monospacedSystemFont(ofSize: 12, weight: .bold),
+                font: .monospacedSystemFont(ofSize: row.depth > 0 ? 10.5 : 12, weight: row.depth > 0 ? .semibold : .bold),
                 color: Palette.phosphor
             )
             drawText(
@@ -3225,7 +3294,7 @@ private final class IslandView: NSView {
                 alignment: .right
             )
             drawText(
-                prompt?.line ?? activity.detail,
+                prompt?.line ?? row.subagentSummary ?? activity.detail,
                 in: NSRect(x: textX, y: rowTop - 40, width: bodyRight - textX - 10, height: 12),
                 font: .monospacedSystemFont(ofSize: 9, weight: .medium),
                 color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
@@ -3440,7 +3509,7 @@ private final class IslandView: NSView {
     private func statusText(for phase: ThreadPhase) -> String {
         switch phase {
         case .running: return "RUNNING"
-        case .delegating: return "DELEGATING"
+        case .delegating: return "AGENTS"
         case .ready: return ""
         case .stopped: return "STOPPED"
         case .seen: return ""
@@ -3505,12 +3574,13 @@ private final class IslandView: NSView {
     }
 
     private func updateAccessibilityValue() {
-        let running = activities.filter { $0.phase == .running }.count
-        let delegating = groupActivities(activities).filter { $0.phase == .delegating }.count
-        let ready = activities.filter { $0.phase == .ready }.count
-        let stopped = activities.filter { $0.phase == .stopped }.count
-        let seen = activities.filter { $0.phase == .seen }.count
-        let asking = activities.filter { $0.prompt != nil }.count
+        let groups = groupActivities(activities)
+        let running = groups.filter { $0.phase == .running }.count
+        let delegating = groups.filter { $0.phase == .delegating }.count
+        let ready = groups.filter { $0.phase == .ready }.count
+        let stopped = groups.filter { $0.phase == .stopped }.count
+        let seen = groups.filter { $0.phase == .seen }.count
+        let asking = groups.filter(\.asking).count
         let agentCounts = [AgentKind.opencode, .opencode2, .claude].compactMap { agent -> String? in
             let count = activities.filter { $0.agent == agent }.count
             guard count > 0, let label = agentRowLabel(agent) else { return nil }
@@ -3519,6 +3589,7 @@ private final class IslandView: NSView {
         setAccessibilityValue(
             "\(asking) asking, \(running) running, \(delegating) delegating, \(ready) ready, \(stopped) stopped, \(seen) seen"
                 + (agentCounts.isEmpty ? "" : ", \(agentCounts)")
+                + groups.filter { !$0.children.isEmpty }.map { ", \($0.root.title): \($0.subagentSummary)" }.joined()
                 + ", \(remainingUsageSummary(accountUsage))"
                 + ", \(remainingUsageSummary(claudeUsage, agent: .claude))"
         )
@@ -4037,17 +4108,17 @@ private func runSelfTest() {
     try! handle.seekToEnd()
     try! handle.write(contentsOf: completed + Data("\n".utf8))
     try! handle.close()
-    assert(waitUntil(timeout: 3) { latest.first(where: { $0.id == "self-test" })?.phase == .ready && completions.count == 1 })
-    assert(completions.first?.id == "self-test")
-    // A child may still be active without changing the completed parent row.
-    assert(groupActivities(latest).first { $0.root.id == "self-test" }?.phase == .ready)
+    assert(waitUntil(timeout: 3) { latest.first(where: { $0.id == "self-test" })?.phase == .ready })
+    assert(completions.isEmpty, "Completion must wait for the subagents")
+    assert(groupActivities(latest).first { $0.root.id == "self-test" }?.phase == .delegating,
+           "A parent must stay active while a subagent is running")
     let childHandle = try! FileHandle(forWritingTo: childSession)
     try! childHandle.seekToEnd()
     try! childHandle.write(contentsOf: currentCodexResponse + Data("\n".utf8) + completed + Data("\n".utf8))
     try! childHandle.close()
     assert(waitUntil(timeout: 3) { latest.first(where: { $0.id == "child" })?.phase == .ready })
     assert(latest.first(where: { $0.id == "child" })?.detail == "Names restored.")
-    assert(completions.count == 1)
+    assert(waitUntil { completions.count == 1 } && completions.first?.id == "self-test")
     monitor.acknowledge(codexSources: ["extension"], piSources: [], opencodeSources: [])
     assert(waitUntil { latest.first(where: { $0.id == "self-test" })?.phase == .seen })
     let phaseBeforeTitleUpdates = latest.first { $0.id == "self-test" }?.phase
@@ -4554,6 +4625,23 @@ private func runClaudeSelfTest() {
     assert(state.event == .cancelled && state.model == "claude-sonnet-4-6")
     assert(claudeSource("claude-desktop") == "desktop" && claudeSource("claude-vscode") == "extension")
     assert(agentRowLabel(.claude) == "claude")
+    let handback = record(["type": "assistant", "message": ["stop_reason": NSNull(),
+        "content": [["type": "tool_use", "id": "handback-1", "name": "SubagentHandback", "input": ["message": "Pipeline mapped."]]]]])
+    let handbackResult = record(["type": "user", "message": ["content": [
+        ["type": "tool_result", "tool_use_id": "handback-1", "content": [["type": "text", "text": "{\"success\":true}"]]]]]])
+    state.consume(user)
+    state.consume(handback)
+    assert(state.event == .started)
+    state.consume(handbackResult)
+    assert(state.event == .completed && state.response == "Pipeline mapped.", "Claude handback results must finish the subagent")
+    state.consume(user)
+    state.consume(handback)
+    state.consume(record(["type": "user", "message": ["content": [
+        ["type": "tool_result", "tool_use_id": "handback-1", "content": "{\"success\":false}"]]]]))
+    assert(state.event == .started, "A failed handback must not finish the subagent")
+    state.consume(record(["type": "assistant", "message": ["content": [
+        ["type": "tool_use", "id": "bash-progress", "name": "Bash", "input": ["description": "Compare HEAD routes and refresh job"]]]]]))
+    assert(state.response == "Bash: Compare HEAD routes and refresh job")
     assert(shouldMarkStopped(.running, updatedAt: Date().addingTimeInterval(-claudeRunningInactivityTimeout - 1), timeout: claudeRunningInactivityTimeout))
 
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-claude-\(UUID().uuidString)")
@@ -4565,6 +4653,7 @@ private func runClaudeSelfTest() {
     let cliFile = project.appendingPathComponent("claude-test.jsonl")
     let desktopFile = project.appendingPathComponent("desktop-test.jsonl")
     let childFile = children.appendingPathComponent("agent-child.jsonl")
+    let secondChildFile = children.appendingPathComponent("agent-second.jsonl")
     let split = tool.count / 2
     let header = Data(#"{"type":"mode","mode":"normal","sessionId":"claude-test"}"#.utf8) + Data([0x0A])
     try! (header + generatedTitle + user + tool.prefix(split)).write(to: cliFile)
@@ -4572,9 +4661,17 @@ private func runClaudeSelfTest() {
     let desktopDone = record(["type": "assistant", "message": ["stop_reason": "end_turn", "content": "Desktop done."]], sessionID: "desktop-test", entrypoint: "claude-desktop")
     try! (desktopUser + desktopDone).write(to: desktopFile)
     try! record(["type": "user", "isSidechain": true, "agentId": "child", "message": ["content": "Explore files"]]).write(to: childFile)
+    try! record(["type": "user", "isSidechain": true, "agentId": "second", "message": ["content": "Explore integration"]]).write(to: secondChildFile)
     let stale = record(["type": "assistant", "timestamp": claudeTimestamp.string(from: Date().addingTimeInterval(-activityRetention - 10)), "message": ["stop_reason": "end_turn"]], sessionID: "stale")
     try! (record(["type": "user", "timestamp": claudeTimestamp.string(from: Date().addingTimeInterval(-activityRetention - 20)), "message": ["content": "Old task"]], sessionID: "stale") + stale)
         .write(to: project.appendingPathComponent("stale.jsonl"))
+    let oldChildren = project.appendingPathComponent("old-parent/subagents", isDirectory: true)
+    try! FileManager.default.createDirectory(at: oldChildren, withIntermediateDirectories: true)
+    try! record(["type": "assistant", "timestamp": claudeTimestamp.string(from: Date().addingTimeInterval(-activityRetention - 10)),
+        "message": ["stop_reason": "end_turn", "content": "Waiting for a long subagent"]], sessionID: "old-parent")
+        .write(to: project.appendingPathComponent("old-parent.jsonl"))
+    try! record(["type": "user", "isSidechain": true, "agentId": "long", "message": ["content": "Long analysis"]], sessionID: "old-parent")
+        .write(to: oldChildren.appendingPathComponent("agent-long.jsonl"))
 
     var latest: [ThreadActivity] = []
     var completions: [ThreadActivity] = []
@@ -4590,8 +4687,10 @@ private func runClaudeSelfTest() {
             && latest.contains { $0.parentID == "claude-test" }
     }, "Claude bootstrap: \(latest.map { "\($0.key) \($0.phase) \($0.source) parent=\($0.parentID ?? "none")" })")
     assert(!latest.contains { $0.id == "stale" })
+    assert(groupActivities(latest).first { $0.root.id == "old-parent" }?.phase == .delegating,
+           "A completed parent must not expire while its subagent is active")
     assert(completions.isEmpty && askings.isEmpty)
-    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.count == 1)
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.count == 2)
     assert(latest.first { $0.id == "claude-test" }?.project == "workspace")
     assert(latest.first { $0.id == "claude-test" }?.title == "Generated session title")
 
@@ -4609,10 +4708,24 @@ private func runClaudeSelfTest() {
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test" }?.usage?.totalTokens == 378 })
     assert(latest.first { $0.id == "claude-test" }?.phase == .running && completions.isEmpty)
     append(done + duration + cost)
-    append(done, to: childFile)
+    assert(waitUntil(timeout: 3) { groupActivities(latest).first { $0.root.id == "claude-test" }?.phase == .delegating })
+    assert(completions.isEmpty)
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentSummary == "2 subagents · 2 running")
+    monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
+    append(record(["type": "user", "message": ["content": [["type": "tool_result", "tool_use_id": "spawn-child", "content": "Started"]]],
+        "toolUseResult": ["agentId": "child", "description": "Map preparation/publication pipeline"]]))
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test:agent:child" }?.title == "Map preparation/publication pipeline" })
+    append(done + duration + cost)
+    append(handback + handbackResult, to: childFile)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test:agent:child" }?.phase == .ready })
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentSummary == "2 subagents · 1 running · 1 done")
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.first?.phase == .running,
+           "Active subagents must stay above completed children")
+    assert(completions.isEmpty)
+    append(handback + handbackResult, to: secondChildFile)
     assert(waitUntil(timeout: 3) {
         latest.first { $0.id == "claude-test" }?.phase == .ready
-            && latest.first { $0.parentID == "claude-test" }?.phase == .ready
+            && latest.filter { $0.parentID == "claude-test" }.allSatisfy { $0.phase == .ready }
             && completions.count == 1
     })
     let finished = latest.first { $0.id == "claude-test" }
@@ -4636,6 +4749,12 @@ private func runClaudeSelfTest() {
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "desktop-test" }?.phase == .stopped })
     assert(latest.first { $0.id == "desktop-test" }?.prompt == nil)
     assert(latest.first { $0.id == "desktop-test" }?.source == "desktop")
+    append(record(["type": "assistant", "message": ["stop_reason": "end_turn", "content": "Long analysis complete"]], sessionID: "old-parent"),
+        to: oldChildren.appendingPathComponent("agent-long.jsonl"))
+    assert(waitUntil(timeout: 3) {
+        groupActivities(latest).first { $0.root.id == "old-parent" }?.phase == .ready
+            && completions.filter { $0.id == "old-parent" }.count == 1
+    }, "A long-running subagent must finish its retained parent and notify once")
     monitor.stop()
 
     let replay = SessionMonitor()
