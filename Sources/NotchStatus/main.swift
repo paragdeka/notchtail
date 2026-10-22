@@ -3,6 +3,7 @@ import CoreServices
 import Darwin
 import Foundation
 import Security
+import ServiceManagement
 import SQLite3
 import UserNotifications
 
@@ -148,6 +149,23 @@ private func agentRowLabel(_ agent: AgentKind) -> String? {
     case .opencode2: return "oc2"
     case .claude: return "claude"
     case .codex, .pi: return nil
+    }
+}
+
+// a subagent usually inherits its parent's model; show only what differs, often just the reasoning level.
+private func modelDelta(_ model: String, parent: String?) -> String? {
+    guard !model.isEmpty, model != parent else { return nil }
+    let parts = model.split(separator: "/", maxSplits: 1)
+    if parts.count == 2, parent?.split(separator: "/", maxSplits: 1).first == parts[0] { return "/\(parts[1])" }
+    return model
+}
+
+// names the surface a session runs in, so the colored source marker beside it explains itself.
+private func surfaceLabel(_ agent: AgentKind, source: String) -> String? {
+    switch agent {
+    case .codex: return ["codex": "desktop", "extension": "extension", "cli": "cli"][source]
+    case .claude: return source
+    case .pi, .opencode, .opencode2: return nil
     }
 }
 
@@ -3074,15 +3092,24 @@ private struct ActivityGroup {
     let updatedAt: Date
     let asking: Bool
 
-    var subagentSummary: String {
-        var parts = ["\(children.count) subagent\(children.count == 1 ? "" : "s")"]
-        for (label, count) in [
+    private var childCounts: [(label: String, count: Int)] {
+        [
             ("running", children.filter { $0.phase == .running && $0.prompt == nil }.count),
             ("asking", children.filter { $0.prompt != nil }.count),
             ("done", children.filter { $0.phase == .ready || $0.phase == .seen }.count),
             ("stopped", children.filter { $0.phase == .stopped }.count),
-        ] where count > 0 { parts.append("\(count) \(label)") }
-        return parts.joined(separator: " · ")
+        ].filter { $0.count > 0 }
+    }
+
+    var subagentSummary: String {
+        (["\(children.count) subagent\(children.count == 1 ? "" : "s")"] + childCounts.map { "\($0.count) \($0.label)" })
+            .joined(separator: " · ")
+    }
+
+    // the disclosure button carries the live count so the parent row keeps its own latest response.
+    var subagentBadge: String {
+        let running = children.filter { $0.phase == .running }.count
+        return running > 0 ? "\(running)/\(children.count) running" : "\(children.count) agent\(children.count == 1 ? "" : "s")"
     }
 }
 
@@ -3092,6 +3119,14 @@ private struct ActivityRow {
     let depth: Int
     let childCount: Int
     var subagentSummary: String? = nil
+    var subagentBadge: String? = nil
+    var subagentAsking = false
+    // distance from the top of the row list; subagent rows are shorter than thread rows.
+    var offset: CGFloat = 0
+    var height: CGFloat = 0
+    var isFirstChild = false
+    var isLastChild = false
+    var parentModel: String? = nil
 }
 
 private func groupActivities(_ activities: [ThreadActivity]) -> [ActivityGroup] {
@@ -3188,55 +3223,68 @@ private func usageSummary(_ usage: UsageSnapshot?) -> String {
     return parts.joined(separator: " · ")
 }
 
-private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex, compact: Bool = false) -> String {
-    func window(_ label: String, _ limit: RateLimitUsage?) -> String {
-        let label = compact && label == "weekly" ? "7d" : label
-        guard let limit else { return "\(label) \(compact ? "—" : "unavailable")" }
-        var text = "\(label) \(compactPercent(max(0, 100 - limit.usedPercent)))%\(compact ? "" : " left")"
-        if let date = limit.resetsAt {
-            // Provider timestamps can land just before or after a minute boundary.
-            let minute = Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded() * 60)
-            let day = limit.windowMinutes >= 24 * 60 ? "\(resetDateFormatter.string(from: minute)) " : ""
-            text += " ↻ \(day)\(resetTimeFormatter.string(from: minute))"
-        }
+private func usageWindows(_ usage: UsageSnapshot?, agent: AgentKind) -> [(label: String, minutes: Int, limit: RateLimitUsage?)] {
+    if agent == .claude { return [("5h", 300, usage?.primaryLimit), ("weekly", 10_080, usage?.secondaryLimit)] }
+    return [usage?.primaryLimit, usage?.secondaryLimit].compactMap { $0 }
+        .sorted { $0.windowMinutes < $1.windowMinutes }
+        .map { (rateWindowLabel($0.windowMinutes), $0.windowMinutes, $0) }
+}
+
+private func resetLabel(_ limit: RateLimitUsage) -> String? {
+    guard let date = limit.resetsAt else { return nil }
+    // Provider timestamps can land just before or after a minute boundary.
+    let minute = Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded() * 60)
+    let day = limit.windowMinutes >= 24 * 60 ? "\(resetDateFormatter.string(from: minute)) " : ""
+    return "\(day)\(resetTimeFormatter.string(from: minute))"
+}
+
+private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex) -> String {
+    let windows = usageWindows(usage, agent: agent)
+    var parts = [agent.displayName]
+    parts += windows.isEmpty ? ["usage unavailable"] : windows.map { label, _, limit in
+        guard let limit else { return "\(label) unavailable" }
+        var text = "\(label) \(compactPercent(max(0, 100 - limit.usedPercent)))% left"
+        if let reset = resetLabel(limit) { text += " ↻ \(reset)" }
         return text
     }
-    var parts = compact ? [] : [agent.displayName]
-    if agent == .claude {
-        parts += [("5h", usage?.primaryLimit), ("weekly", usage?.secondaryLimit)].map { label, limit in
-            window(label, limit)
-        }
-    } else {
-        let limits = [usage?.primaryLimit, usage?.secondaryLimit].compactMap { $0 }
-            .sorted { $0.windowMinutes < $1.windowMinutes }
-        parts += limits.isEmpty ? [compact ? "—" : "usage unavailable"] : limits.map {
-            window(rateWindowLabel($0.windowMinutes), $0)
-        }
-    }
-    if let reason = usage?.unavailableReason {
-        parts.append(compact ? (reason.hasPrefix("Keychain") ? "🔒" : "⚠") : (usage?.refreshWarning ?? reason))
-    }
+    if let warning = usage?.refreshWarning { parts.append(warning) }
     return parts.joined(separator: " · ")
 }
 
-private func piUsageSummary(_ activities: [ThreadActivity]) -> String {
-    let piActivities = activities.filter { $0.agent == .pi }
-    guard !piActivities.isEmpty else { return "" }
-    let tokens = piActivities.compactMap { $0.usage?.totalTokens }.reduce(0, +)
-    let cost = piActivities.compactMap { $0.usage?.costTotal }.reduce(0, +)
-    var parts = ["pi \(compactTokens(tokens)) tok"]
-    if cost > 0 { parts.append("$\(String(format: "%.2f", cost))") }
-    return parts.joined(separator: " · ")
+// one footer cell per usage window; a nil remainingPercent marks an unavailable window.
+private struct LimitCell: Equatable {
+    let label: String
+    let windowMinutes: Int
+    let remainingPercent: Double?
+    let reset: String?
 }
 
-private func agentUsageSummary(_ activities: [ThreadActivity], agent: AgentKind = .opencode) -> String {
-    let sessions = activities.filter { $0.agent == agent }
-    guard !sessions.isEmpty else { return "" }
-    let tokens = sessions.compactMap { $0.usage?.totalTokens }.reduce(0, +)
-    let cost = sessions.compactMap { $0.usage?.costTotal }.reduce(0, +)
-    var parts = ["\(agentRowLabel(agent) ?? agent.label) \(compactTokens(tokens)) tok"]
-    if cost > 0 { parts.append("$\(String(format: "%.2f", cost))") }
-    return parts.joined(separator: " · ")
+private func limitCells(_ usage: UsageSnapshot?, agent: AgentKind) -> [LimitCell] {
+    usageWindows(usage, agent: agent).map { label, minutes, limit in
+        LimitCell(
+            label: label == "weekly" ? "7d" : label,
+            windowMinutes: minutes,
+            remainingPercent: limit.map { max(0, 100 - $0.usedPercent) },
+            reset: limit.flatMap(resetLabel)
+        )
+    }
+}
+
+private func limitStatusSymbol(_ usage: UsageSnapshot?) -> String? {
+    guard let reason = usage?.unavailableReason else { return nil }
+    return reason.hasPrefix("Keychain") ? "🔒" : "⚠"
+}
+
+private enum LimitLevel: Equatable {
+    case normal
+    case low
+    case critical
+}
+
+private func limitLevel(remainingPercent: Double) -> LimitLevel {
+    if remainingPercent <= 10 { return .critical }
+    if remainingPercent <= 25 { return .low }
+    return .normal
 }
 
 // draw() runs on every animation frame; creating system fonts there churns
@@ -3246,9 +3294,11 @@ private enum Typeface {
     static let title = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
     static let childTitle = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
     static let body = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-    static let badge = NSFont.monospacedSystemFont(ofSize: 9, weight: .bold)
-    static let caption = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
-    static let footer = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .medium)
+    static let badge = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
+    static let caption = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    static let footer = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+    static let disclosure = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
+    static let tag = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
 }
 
 private enum Palette {
@@ -3263,8 +3313,12 @@ private enum Palette {
     static let claudeCoral = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.35, alpha: 1)
     static let askPink = NSColor(srgbRed: 1.0, green: 0.35, blue: 0.66, alpha: 1)
     static let phosphor = NSColor(white: 0.94, alpha: 1)
-    static let tertiaryInk = NSColor(white: 0.46, alpha: 1)
-    static let mutedInk = NSColor(white: 0.29, alpha: 1)
+    // muted text sits near the 4.5:1 contrast floor on black; the old 0.29 grey was ~2.3:1 and unreadable at 9pt.
+    static let tertiaryInk = NSColor(white: 0.64, alpha: 1)
+    static let mutedInk = NSColor(white: 0.47, alpha: 1)
+    static let hairline = NSColor(white: 1, alpha: 0.1)
+    static let treeGuide = NSColor(white: 1, alpha: 0.2)
+    static let tagFill = NSColor(white: 1, alpha: 0.09)
 }
 
 private func notificationWarning(
@@ -3284,6 +3338,146 @@ private func notificationWarning(
     }
 }
 
+private enum FooterPiece {
+    case text(String, NSColor)
+    case meter(Double, NSColor)
+    case dashes(CGFloat, NSColor)
+    case space(CGFloat)
+}
+
+// footer pieces measured once per data change, then drawn left to right on every frame.
+private struct FooterRun {
+    private(set) var pieces: [(piece: FooterPiece, width: CGFloat)] = []
+    private(set) var width: CGFloat = 0
+
+    mutating func append(_ piece: FooterPiece) {
+        let pieceWidth: CGFloat
+        switch piece {
+        case let .text(text, _): pieceWidth = Self.width(of: text)
+        case .meter: pieceWidth = 20
+        case let .dashes(dashes, _): pieceWidth = dashes
+        case let .space(space): pieceWidth = space
+        }
+        pieces.append((piece, pieceWidth))
+        width += pieceWidth
+    }
+
+    static func width(of text: String) -> CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: Typeface.footer]).width)
+    }
+
+    var text: String {
+        pieces.compactMap { piece, _ -> String? in
+            guard case let .text(text, _) = piece else { return nil }
+            return text
+        }.joined(separator: " ")
+    }
+}
+
+private struct FooterLayout {
+    struct LimitLine {
+        let agent: AgentKind
+        // keyed by window length, so each window lines up with the same window on the other provider's row.
+        let cells: [Int: (label: String, run: FooterRun)]
+        // shown in the first column when the provider reports no windows at all.
+        let placeholder: FooterRun?
+        let status: FooterRun?
+    }
+
+    struct Column {
+        let minutes: Int
+        // stands in for a window the plan doesn't have, e.g. the 5h limit on ChatGPT Pro.
+        let absent: FooterRun
+        var width: CGFloat
+    }
+
+    let limitLines: [LimitLine]
+    let columns: [Column]
+
+    // "no limit" means the plan lacks the window; the dash means nothing loaded at all.
+    func run(for line: LimitLine, column index: Int) -> FooterRun? {
+        let column = columns[index]
+        if let cell = line.cells[column.minutes] { return cell.run }
+        if let placeholder = line.placeholder { return index == 0 ? placeholder : nil }
+        return column.absent
+    }
+}
+
+private func limitColor(_ level: LimitLevel) -> NSColor {
+    switch level {
+    case .normal: return Palette.tertiaryInk
+    case .low: return Palette.pacYellow
+    case .critical: return Palette.stoppedOrange
+    }
+}
+
+private func footerRun(for cell: LimitCell) -> FooterRun {
+    var run = FooterRun()
+    run.append(.text(cell.label, Palette.tertiaryInk))
+    run.append(.space(5))
+    guard let remaining = cell.remainingPercent else {
+        run.append(.text("—", Palette.mutedInk))
+        return run
+    }
+    let color = limitColor(limitLevel(remainingPercent: remaining))
+    run.append(.meter(remaining / 100, color))
+    run.append(.space(5))
+    run.append(.text("\(compactPercent(remaining))%", color))
+    if let reset = cell.reset {
+        run.append(.space(6))
+        run.append(.text("↻ \(reset)", Palette.mutedInk))
+    }
+    return run
+}
+
+private func footerLimitLine(_ usage: UsageSnapshot?, agent: AgentKind) -> FooterLayout.LimitLine {
+    let cells = Dictionary(
+        limitCells(usage, agent: agent).map { ($0.windowMinutes, (label: $0.label, run: footerRun(for: $0))) },
+        uniquingKeysWith: { first, _ in first }
+    )
+    var placeholder: FooterRun?
+    if cells.isEmpty {
+        var unavailable = FooterRun()
+        unavailable.append(.text("—", Palette.mutedInk))
+        placeholder = unavailable
+    }
+    let status = limitStatusSymbol(usage).map { symbol -> FooterRun in
+        var run = FooterRun()
+        run.append(.text(symbol, Palette.pacYellow))
+        return run
+    }
+    return FooterLayout.LimitLine(agent: agent, cells: cells, placeholder: placeholder, status: status)
+}
+
+// a dashed track stretches between the label and a right-aligned note, so the cell spans its column
+// exactly like a real window does, whatever width the neighbouring reset times give that column.
+private func absentFooterRun(label: String, filling width: CGFloat) -> FooterRun {
+    let note = "no limit"
+    let fixedWidth = FooterRun.width(of: label) + 5 + 6 + FooterRun.width(of: note)
+    var run = FooterRun()
+    run.append(.text(label, Palette.mutedInk))
+    run.append(.space(5))
+    run.append(.dashes(max(20, width - fixedWidth), Palette.mutedInk.withAlphaComponent(0.55)))
+    run.append(.space(6))
+    run.append(.text(note, Palette.mutedInk))
+    return run
+}
+
+private func footerColumns(for lines: [FooterLayout.LimitLine]) -> [FooterLayout.Column] {
+    let labels = Dictionary(lines.flatMap { $0.cells.map { ($0.key, $0.value.label) } }, uniquingKeysWith: { first, _ in first })
+    var columns = labels.keys.sorted().map { minutes -> FooterLayout.Column in
+        let width = lines.compactMap { $0.cells[minutes]?.run.width }.max() ?? 0
+        let absent = absentFooterRun(label: labels[minutes]!, filling: width)
+        let missing = lines.contains { $0.cells[minutes] == nil && $0.placeholder == nil }
+        return FooterLayout.Column(minutes: minutes, absent: absent, width: missing ? max(width, absent.width) : width)
+    }
+    if let placeholderWidth = lines.compactMap({ $0.placeholder?.width }).max() {
+        if columns.isEmpty { columns = [FooterLayout.Column(minutes: 0, absent: FooterRun(), width: 0)] }
+        columns[0].width = max(columns[0].width, placeholderWidth)
+    }
+    return columns
+}
+
 private final class IslandView: NSView {
     var onExpansionChange: ((Bool) -> Void)?
     private(set) var expanded = false
@@ -3292,12 +3486,14 @@ private final class IslandView: NSView {
     private var accountUsage: UsageSnapshot? { didSet { invalidateLayout() } }
     private var claudeUsage: UsageSnapshot? { didSet { invalidateLayout() } }
     private var cachedRows: [ActivityRow]?
-    private var cachedFooterLines: [(agent: AgentKind?, text: String)]?
+    private var cachedHiddenRowCount = 0
+    private var cachedFooterLayout: FooterLayout?
     private var topBandHeight: CGFloat = 32
     private var physicalNotchWidth: CGFloat = 0
     private var tracking: NSTrackingArea?
     private var animationTimer: Timer?
     private var collapseWorkItem: DispatchWorkItem?
+    private var hoverWorkItem: DispatchWorkItem?
     private var disclosureButtons: [String: NSButton] = [:]
     private let notificationButton = NSButton()
     private var notificationWarning: String? { didSet { invalidateLayout() } }
@@ -3305,26 +3501,24 @@ private final class IslandView: NSView {
     private var mouthOpen = true
     private var pacmanProgress: CGFloat = 0
     private let rowHeight: CGFloat = 58
+    private let childRowHeight: CGFloat = 40
+    private var maxRowsHeight: CGFloat { 8 * rowHeight }
+    // a pointer passing over the notch on its way to the menu bar should not unfold the island.
+    private let hoverIntentDelay: TimeInterval = 0.15
     private func invalidateLayout() {
         cachedRows = nil
-        cachedFooterLines = nil
+        cachedFooterLayout = nil
     }
 
-    private var footerLines: [(agent: AgentKind?, text: String)] {
-        if let cachedFooterLines { return cachedFooterLines }
-        var lines: [(agent: AgentKind?, text: String)] = [
-            (.codex, remainingUsageSummary(accountUsage, compact: true)),
-            (.claude, remainingUsageSummary(claudeUsage, agent: .claude, compact: true)),
-        ]
-        let sessions = [piUsageSummary(activities), agentUsageSummary(activities),
-            agentUsageSummary(activities, agent: .opencode2)]
-            .filter { !$0.isEmpty }.joined(separator: " · ")
-        if !sessions.isEmpty { lines.append((nil, sessions)) }
-        cachedFooterLines = lines
-        return lines
+    private var footerLayout: FooterLayout {
+        if let cachedFooterLayout { return cachedFooterLayout }
+        let limitLines = [footerLimitLine(accountUsage, agent: .codex), footerLimitLine(claudeUsage, agent: .claude)]
+        let layout = FooterLayout(limitLines: limitLines, columns: footerColumns(for: limitLines))
+        cachedFooterLayout = layout
+        return layout
     }
     private var notificationWarningHeight: CGFloat { notificationWarning == nil ? 0 : 26 }
-    private var footerHeight: CGFloat { CGFloat(footerLines.count) * 15 + 11 + notificationWarningHeight }
+    private var footerHeight: CGFloat { CGFloat(footerLayout.limitLines.count) * 15 + 11 + notificationWarningHeight }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -3355,15 +3549,19 @@ private final class IslandView: NSView {
 
     func update(activities: [ThreadActivity], accountUsage: UsageSnapshot?, claudeUsage: UsageSnapshot? = nil) {
         let previousGroups = Set(groupActivities(self.activities).filter { !$0.children.isEmpty }.map { $0.root.key })
+        let previouslyAsking = Set(self.activities.filter { $0.prompt != nil }.map(\.key))
         self.activities = activities
         self.accountUsage = accountUsage
         self.claudeUsage = claudeUsage
         toolTip = claudeUsage?.refreshWarning
         expandedGroupIDs.formIntersection(groupActivities(activities).map { activityUIIdentity($0.root) })
-        expandedGroupIDs.formUnion(groupActivities(activities).filter {
-            !previousGroups.contains($0.root.key) && $0.children.contains { $0.phase == .running }
+        // a subagent that starts asking reopens its group even if it was collapsed by hand.
+        expandedGroupIDs.formUnion(groupActivities(activities).filter { group in
+            (!previousGroups.contains(group.root.key) && group.children.contains { $0.phase == .running })
+                || group.children.contains { $0.prompt != nil && !previouslyAsking.contains($0.key) }
         }.map { $0.root.key })
         syncDisclosureButtons()
+        layoutNotificationButton()
         updateAnimationTimer()
         updateAccessibilityValue()
         needsDisplay = true
@@ -3421,15 +3619,33 @@ private final class IslandView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
+        cancelHoverIntent()
         schedulePointerCheck()
     }
 
     private func updateExpansion(for event: NSEvent) {
         guard islandPath().contains(convert(event.locationInWindow, from: nil)) else {
+            cancelHoverIntent()
             schedulePointerCheck()
             return
         }
-        setExpanded(true)
+        guard !expanded else {
+            setExpanded(true)
+            return
+        }
+        guard hoverWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            hoverWorkItem = nil
+            if pointerIsInsideIsland { setExpanded(true) }
+        }
+        hoverWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + hoverIntentDelay, execute: work)
+    }
+
+    private func cancelHoverIntent() {
+        hoverWorkItem?.cancel()
+        hoverWorkItem = nil
     }
 
     private func schedulePointerCheck() {
@@ -3454,6 +3670,7 @@ private final class IslandView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        cancelHoverIntent()
         let point = convert(event.locationInWindow, from: nil)
         guard islandPath().contains(point) else {
             if expanded { setExpanded(false) }
@@ -3468,18 +3685,23 @@ private final class IslandView: NSView {
         layoutNotificationButton()
     }
 
+    // the collapsed island only has room for one indicator per ear; agent status outranks the settings warning.
+    private var collapsedIslandIsIdle: Bool {
+        !activities.contains { $0.prompt != nil }
+            && !groupActivities(activities).contains { [.running, .delegating, .stopped, .ready].contains($0.phase) }
+    }
+
     private func layoutNotificationButton() {
-        notificationButton.isHidden = notificationWarning == nil
+        notificationButton.isHidden = notificationWarning == nil || (!expanded && !collapsedIslandIsIdle)
         guard let warning = notificationWarning else { return }
         notificationButton.title = "\(warning) · Open settings ↗"
         notificationButton.imagePosition = expanded ? .imageLeft : .imageOnly
         notificationButton.setAccessibilityLabel("\(warning). Open notification settings")
         notificationButton.toolTip = "Enable notifications and banners for notchtail in System Settings to receive task and attention alerts."
-        let bodyRight = bounds.maxX - bodyInset
         notificationButton.frame = expanded
             ? NSRect(x: bounds.minX + bodyInset + 12, y: footerHeight - notificationWarningHeight,
                 width: bounds.width - 2 * bodyInset - 24, height: notificationWarningHeight)
-            : NSRect(x: bodyRight - 32, y: bounds.maxY - topBandHeight / 2 - 12, width: 24, height: 24)
+            : NSRect(x: bounds.minX + bodyInset + collapsedEarInset - 12, y: bounds.maxY - topBandHeight / 2 - 12, width: 24, height: 24)
     }
 
     @objc private func openNotificationSettings(_ sender: Any?) {
@@ -3491,29 +3713,82 @@ private final class IslandView: NSView {
         }
     }
 
-    var visibleRowCount: Int { visibleRows.count }
-    var expandedContentHeight: CGFloat { CGFloat(max(1, visibleRowCount)) * rowHeight + footerHeight + 10 }
+    private var rowsHeight: CGFloat { visibleRows.last.map { $0.offset + $0.height } ?? rowHeight }
+    private var overflowHeight: CGFloat { hiddenRowCount > 0 ? 16 : 0 }
+    var expandedContentHeight: CGFloat {
+        rowsHeight + overflowHeight + footerHeight + 10
+    }
 
     private var visibleRows: [ActivityRow] {
         if let cachedRows { return cachedRows }
         var rows: [ActivityRow] = []
-        for group in groupActivities(activities).prefix(5) where rows.count < 8 {
+        var used: CGFloat = 0
+        var hidden = 0
+        func fits(_ height: CGFloat) -> Bool { used + height <= maxRowsHeight }
+        for (index, group) in groupActivities(activities).enumerated() {
+            guard index < 5, fits(rowHeight) else {
+                hidden += 1
+                continue
+            }
             rows.append(ActivityRow(
                 activity: group.root,
                 phase: group.phase,
                 depth: 0,
                 childCount: group.children.count,
-                subagentSummary: group.children.contains { $0.phase == .running } ? group.subagentSummary : nil
+                subagentSummary: group.children.isEmpty ? nil : group.subagentSummary,
+                subagentBadge: group.children.isEmpty ? nil : group.subagentBadge,
+                subagentAsking: group.children.contains { $0.prompt != nil },
+                offset: used,
+                height: rowHeight
             ))
-            if expandedGroupIDs.contains(activityUIIdentity(group.root)) {
-                for child in group.children where rows.count < 8 {
-                    rows.append(ActivityRow(activity: child, phase: child.phase, depth: 1, childCount: 0))
+            used += rowHeight
+            guard expandedGroupIDs.contains(activityUIIdentity(group.root)) else { continue }
+            let firstChildIndex = rows.count
+            for child in group.children {
+                guard fits(childRowHeight) else {
+                    hidden += 1
+                    continue
                 }
+                rows.append(ActivityRow(
+                    activity: child,
+                    phase: child.phase,
+                    depth: 1,
+                    childCount: 0,
+                    offset: used,
+                    height: childRowHeight,
+                    isFirstChild: rows.count == firstChildIndex,
+                    parentModel: group.root.model
+                ))
+                used += childRowHeight
             }
+            if rows.count > firstChildIndex { rows[rows.count - 1].isLastChild = true }
         }
         cachedRows = rows
+        cachedHiddenRowCount = hidden
         return rows
     }
+
+    private var hiddenRowCount: Int {
+        _ = visibleRows
+        return cachedHiddenRowCount
+    }
+
+    private func rowStatus(_ row: ActivityRow) -> (text: String, color: NSColor) {
+        row.activity.prompt != nil
+            ? ("ASKING", Palette.askPink)
+            : (statusText(for: row.phase), statusColor(for: row.phase))
+    }
+
+    // every face is monospaced, so one advance measures any string without per-frame text layout.
+    private static let badgeCharacterWidth = ("M" as NSString).size(withAttributes: [.font: Typeface.badge]).width
+    private static let footerCharacterWidth = ("M" as NSString).size(withAttributes: [.font: Typeface.footer]).width
+    private static let tagCharacterWidth = ("M" as NSString).size(withAttributes: [.font: Typeface.tag]).width
+
+    private func statusPillWidth(_ text: String) -> CGFloat {
+        (CGFloat(text.count) * Self.badgeCharacterWidth + 12).rounded(.up)
+    }
+
+    private var statusPillRight: CGFloat { bounds.maxX - bodyInset - 10 }
 
     private func syncDisclosureButtons() {
         let rows = visibleRows
@@ -3526,25 +3801,27 @@ private final class IslandView: NSView {
             button.identifier = NSUserInterfaceItemIdentifier(id)
             button.isBordered = false
             button.focusRingType = .none
-            button.font = .monospacedSystemFont(ofSize: 9, weight: .semibold)
+            button.font = Typeface.disclosure
             button.contentTintColor = Palette.vscodeBlue
             addSubview(button)
             disclosureButtons[id] = button
         }
         for button in disclosureButtons.values { button.isHidden = true }
         guard expanded else { return }
-        let bodyRight = bounds.maxX - bodyInset
-        for (index, row) in rows.enumerated() where row.depth == 0 && row.childCount > 0 {
+        for row in rows where row.depth == 0 && row.childCount > 0 {
             let identity = activityUIIdentity(row.activity)
             let button = disclosureButtons[identity]!
             let isExpanded = expandedGroupIDs.contains(identity)
-            button.title = "\(isExpanded ? "▾" : "▸") \(row.childCount) agent\(row.childCount == 1 ? "" : "s")"
+            let title = "\(isExpanded ? "▾" : "▸") \(row.subagentBadge ?? "\(row.childCount) agents")"
+            button.title = title
             button.toolTip = row.subagentSummary ?? "\(row.childCount) subagents"
-            button.setAccessibilityLabel("\(isExpanded ? "Hide" : "Show") \(row.childCount) subagents")
+            button.contentTintColor = row.subagentAsking ? Palette.askPink : Palette.vscodeBlue
+            button.setAccessibilityLabel("\(isExpanded ? "Hide" : "Show") \(row.subagentSummary ?? "\(row.childCount) subagents")")
+            let width = ceil((title as NSString).size(withAttributes: [.font: Typeface.disclosure]).width) + 10
             button.frame = NSRect(
-                x: bodyRight - 154,
-                y: bounds.maxY - topBandHeight - CGFloat(index) * rowHeight - 25,
-                width: 84,
+                x: statusPillRight - statusPillWidth(rowStatus(row).text) - 6 - width,
+                y: bounds.maxY - topBandHeight - row.offset - 24,
+                width: width,
                 height: 18
             )
             button.isHidden = false
@@ -3561,9 +3838,34 @@ private final class IslandView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
+        let launchAtLogin = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        launchAtLogin.target = self
+        launchAtLogin.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        let notifications = menu.addItem(
+            withTitle: "Notification Settings…",
+            action: #selector(openNotificationSettings(_:)),
+            keyEquivalent: ""
+        )
+        notifications.target = self
+        menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "Quit notchtail", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            NSLog("Unable to change launch at login: %@", error.localizedDescription)
+            NSSound.beep()
+        }
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -3589,40 +3891,52 @@ private final class IslandView: NSView {
         }
     }
 
+    private static let checkGlyph: [UInt8] = [
+        0b0000000,
+        0b0000001,
+        0b0000010,
+        0b1000100,
+        0b0101000,
+        0b0010000,
+        0b0000000,
+    ]
+
+    private static let crossGlyph: [UInt8] = [
+        0b0000000,
+        0b0100010,
+        0b0010100,
+        0b0001000,
+        0b0010100,
+        0b0100010,
+        0b0000000,
+    ]
+
+    // the ears beside the hardware notch mirror each other: the left says who (or how many), the right says what.
+    private var collapsedEarInset: CGFloat { 18 }
+
     private func drawCollapsed() {
         let centerY = bounds.maxY - topBandHeight / 2
-        let bodyLeft = bounds.minX + bodyInset
         let bodyRight = bounds.maxX - bodyInset
+        let leftEar = NSPoint(x: bounds.minX + bodyInset + collapsedEarInset, y: centerY)
+        let rightEar = NSPoint(x: bodyRight - collapsedEarInset, y: centerY)
         let groups = groupActivities(activities)
         let runningCount = groups.filter { $0.phase == .running || $0.phase == .delegating }.count
-        drawText(
-            String(runningCount),
-            in: NSRect(x: bodyLeft + 14, y: centerY - 8, width: 28, height: 16),
-            font: Typeface.count,
-            color: runningCount > 0 ? Palette.phosphor : Palette.tertiaryInk
-        )
 
-        if let warning = notificationWarning {
-            updateAccessibilityHelp("\(warning). Expand the island to open notification settings")
+        if let prompting = activities.first(where: { $0.prompt != nil }) {
+            drawAgentSprite(agent: prompting.agent, at: leftEar, pixel: 2, color: Palette.askPink, running: false)
+            drawQuestionMark(at: rightEar, pixel: 2, color: Palette.askPink, blink: mouthOpen)
+            updateAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
             return
         }
 
-        if let prompting = activities.first(where: { $0.prompt != nil }) {
-            drawAgentSprite(
-                agent: prompting.agent,
-                at: NSPoint(x: bodyRight - 36, y: centerY),
-                pixel: 2,
-                color: Palette.askPink,
-                running: false
+        if runningCount > 0 {
+            drawText(
+                String(runningCount),
+                in: NSRect(x: leftEar.x - 14, y: centerY - 8, width: 28, height: 16),
+                font: Typeface.count,
+                color: Palette.phosphor,
+                alignment: .center
             )
-            drawQuestionMark(
-                at: NSPoint(x: bodyRight - 20, y: centerY),
-                pixel: 2,
-                color: Palette.askPink,
-                blink: mouthOpen
-            )
-            updateAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
-        } else if runningCount > 0 {
             let runningAgents = Set(groups.filter { $0.phase == .running || $0.phase == .delegating }.map(\.root.agent))
             let track = visiblePacmanTrack(
                 in: bounds,
@@ -3656,26 +3970,28 @@ private final class IslandView: NSView {
             NSGraphicsContext.restoreGraphicsState()
             updateAccessibilityHelp("Agent is working")
         } else if let stopped = groups.first(where: { $0.phase == .stopped }) {
-            drawAgentSprite(
-                agent: stopped.root.agent,
-                at: NSPoint(x: bodyRight - 20, y: centerY),
-                pixel: 2,
-                color: Palette.stoppedOrange,
-                running: false
-            )
+            drawAgentSprite(agent: stopped.root.agent, at: leftEar, pixel: 2, color: Palette.stoppedOrange, running: false)
+            drawPixelSprite(Self.crossGlyph, at: rightEar, pixel: 2, color: Palette.stoppedOrange, bob: false)
             updateAccessibilityHelp("\(stopped.root.title) stopped")
         } else if let ready = groups.first(where: { $0.phase == .ready }) {
-            drawAgentSprite(
-                agent: ready.root.agent,
-                at: NSPoint(x: bodyRight - 20, y: centerY),
-                pixel: 2,
-                color: Palette.readyGreen,
-                running: false
-            )
+            drawAgentSprite(agent: ready.root.agent, at: leftEar, pixel: 2, color: Palette.readyGreen, running: false)
+            drawPixelSprite(Self.checkGlyph, at: rightEar, pixel: 2, color: Palette.readyGreen, bob: false)
             updateAccessibilityHelp("\(ready.root.title) is complete")
+        } else if let warning = notificationWarning {
+            // the bell button sits in the left ear.
+            drawText(
+                "OFF",
+                in: capCenteredRect(x: rightEar.x - 14, width: 28, centerY: centerY, font: Typeface.badge),
+                font: Typeface.badge,
+                color: Palette.pacYellow,
+                alignment: .center
+            )
+            updateAccessibilityHelp("\(warning). Expand the island to open notification settings")
         } else {
-            Palette.ghostPurple.setFill()
-            NSBezierPath(ovalIn: NSRect(x: bodyRight - 18, y: centerY - 2, width: 4, height: 4)).fill()
+            Palette.ghostPurple.withAlphaComponent(0.7).setFill()
+            for ear in [leftEar, rightEar] {
+                NSBezierPath(ovalIn: NSRect(x: ear.x - 2, y: centerY - 2, width: 4, height: 4)).fill()
+            }
             updateAccessibilityHelp("No active agent turns")
         }
     }
@@ -3688,99 +4004,261 @@ private final class IslandView: NSView {
         if rows.isEmpty {
             drawText(
                 "No active agent turns",
-                in: NSRect(x: bodyLeft + 16, y: footerHeight + 22, width: bodyRight - bodyLeft - 32, height: 14),
+                in: NSRect(x: bodyLeft + 16, y: footerHeight + 40, width: bodyRight - bodyLeft - 32, height: 14),
                 font: Typeface.body,
-                color: Palette.mutedInk
+                color: Palette.tertiaryInk,
+                alignment: .center
+            )
+            drawText(
+                "Codex, Claude, Pi and opencode turns appear here",
+                in: NSRect(x: bodyLeft + 16, y: footerHeight + 24, width: bodyRight - bodyLeft - 32, height: 13),
+                font: Typeface.footer,
+                color: Palette.mutedInk,
+                alignment: .center
             )
             return
         }
 
-        for (index, row) in rows.enumerated() {
-            let activity = row.activity
-            let rowTop = bounds.maxY - topBandHeight - CGFloat(index) * rowHeight
-            let centerY = rowTop - 18
-            let prompt = activity.prompt
-            let color = prompt != nil ? Palette.askPink : statusColor(for: row.phase)
-            let textX = bodyLeft + 35 + CGFloat(row.depth) * 18
-            let status = prompt != nil ? "ASKING" : row.depth > 0 && (row.phase == .ready || row.phase == .seen) ? "DONE" : statusText(for: row.phase)
-            let statusWidth: CGFloat = 58
-            let statusX = bodyRight - statusWidth - 10
-            let titleRight = row.childCount > 0 ? bodyRight - 158 : status.isEmpty ? bodyRight - 16 : statusX - 4
-            let title = activity.title
-            let metadata = [
-                row.depth > 0 ? activity.nickname : agentRowLabel(activity.agent),
-                row.depth == 0 && activity.agent == .claude ? activity.source : nil,
-                row.depth == 0 ? String(activity.project.prefix(18)) : nil,
-                activity.model,
-                usageSummary(activity.usage),
-                relativeAge(activity.updatedAt),
-            ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
-            if row.depth > 0 {
-                let branch = NSBezierPath()
-                branch.move(to: NSPoint(x: bodyLeft + 16, y: rowTop - 2))
-                branch.line(to: NSPoint(x: bodyLeft + 16, y: centerY))
-                branch.line(to: NSPoint(x: bodyLeft + 25, y: centerY))
-                Palette.mutedInk.setStroke()
-                branch.stroke()
+        for row in rows {
+            let rowTop = bounds.maxY - topBandHeight - row.offset
+            if row.depth == 0 {
+                drawThreadRow(row, top: rowTop, bodyLeft: bodyLeft, bodyRight: bodyRight)
+            } else {
+                drawSubagentRow(row, top: rowTop, bodyLeft: bodyLeft, bodyRight: bodyRight)
             }
-            drawAgentSprite(
-                agent: activity.agent,
-                at: NSPoint(x: bodyLeft + 16 + CGFloat(row.depth) * 18, y: centerY),
-                pixel: 2,
-                color: color,
-                running: row.phase == .running
-            )
+        }
+
+        if hiddenRowCount > 0 {
             drawText(
-                title,
-                in: NSRect(x: textX, y: rowTop - 24, width: max(60, titleRight - textX), height: 16),
-                font: row.depth > 0 ? Typeface.childTitle : Typeface.title,
-                color: Palette.phosphor
-            )
-            drawText(
-                status,
-                in: NSRect(x: statusX, y: rowTop - 23, width: statusWidth, height: 14),
-                font: Typeface.badge,
-                color: color,
-                alignment: .right
-            )
-            drawText(
-                prompt?.line ?? row.subagentSummary ?? activity.detail,
-                in: NSRect(x: textX, y: rowTop - 40, width: bodyRight - textX - 10, height: 12),
-                font: Typeface.caption,
-                color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
-            )
-            drawSourceMarker(agent: activity.agent, source: activity.source, in: NSRect(x: textX, y: rowTop - 53, width: 9, height: 9))
-            drawText(
-                metadata,
-                in: NSRect(x: textX + 14, y: rowTop - 56, width: bodyRight - textX - 24, height: 12),
+                "+\(hiddenRowCount) more",
+                in: NSRect(x: bodyLeft + 16, y: footerHeight + 9, width: bodyRight - bodyLeft - 32, height: 13),
                 font: Typeface.footer,
-                color: Palette.mutedInk
+                color: Palette.mutedInk,
+                alignment: .center
             )
         }
     }
 
+    private func drawThreadRow(_ row: ActivityRow, top rowTop: CGFloat, bodyLeft: CGFloat, bodyRight: CGFloat) {
+        let activity = row.activity
+        let centerY = rowTop - 18
+        let prompt = activity.prompt
+        let status = rowStatus(row)
+        let textX = bodyLeft + 35
+        let pillLeft = drawStatusPill(status.text, color: status.color, centerY: rowTop - 15)
+        let disclosure = row.childCount > 0 ? disclosureButtons[activityUIIdentity(activity)] : nil
+        let titleRight = (disclosure?.isHidden == false ? disclosure!.frame.minX : pillLeft) - 8
+        let metadata = [
+            activity.agent == .claude ? nil : agentRowLabel(activity.agent),
+            surfaceLabel(activity.agent, source: activity.source),
+            String(activity.project.prefix(18)),
+            activity.model,
+            usageSummary(activity.usage),
+            relativeAge(activity.updatedAt),
+        ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+        drawAgentSprite(
+            agent: activity.agent,
+            at: NSPoint(x: bodyLeft + 16, y: centerY),
+            pixel: 2,
+            color: status.color,
+            running: row.phase == .running
+        )
+        drawText(
+            activity.title,
+            in: NSRect(x: textX, y: rowTop - 24, width: max(60, titleRight - textX), height: 16),
+            font: Typeface.title,
+            color: Palette.phosphor
+        )
+        drawText(
+            prompt?.line ?? (activity.detail.isEmpty ? row.subagentSummary ?? "" : activity.detail),
+            in: NSRect(x: textX, y: rowTop - 42, width: bodyRight - textX - 10, height: 14),
+            font: Typeface.caption,
+            color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
+        )
+        drawSourceMarker(agent: activity.agent, source: activity.source, in: NSRect(x: textX, y: rowTop - 53, width: 8, height: 8))
+        drawText(
+            metadata,
+            in: NSRect(x: textX + 13, y: rowTop - 57, width: bodyRight - textX - 23, height: 13),
+            font: Typeface.footer,
+            color: Palette.mutedInk
+        )
+    }
+
+    // subagents get two lines: role, task, usage and status, then the current action.
+    private func drawSubagentRow(_ row: ActivityRow, top rowTop: CGFloat, bodyLeft: CGFloat, bodyRight: CGFloat) {
+        let activity = row.activity
+        let prompt = activity.prompt
+        let status = rowStatus(row)
+        let finished = prompt == nil && (row.phase == .ready || row.phase == .seen)
+        let lineY = rowTop - 12
+        let textX = bodyLeft + 46
+        drawTreeGuide(for: row, top: rowTop, elbowY: lineY, x: bodyLeft + 16)
+        drawAgentSprite(
+            agent: activity.agent,
+            at: NSPoint(x: bodyLeft + 34, y: lineY),
+            pixel: 1.5,
+            color: status.color,
+            running: row.phase == .running
+        )
+
+        // plain status text keeps the parent's filled pill the strongest mark in the group.
+        let statusWidth = CGFloat(status.text.count) * Self.badgeCharacterWidth
+        let statusX = statusPillRight - 6 - statusWidth
+        drawText(
+            status.text,
+            in: capCenteredRect(x: statusX, width: statusWidth + 1, centerY: lineY, font: Typeface.badge),
+            font: Typeface.badge,
+            color: status.color
+        )
+
+        let usage = [
+            modelDelta(activity.model, parent: row.parentModel),
+            activity.usage.map { "\(compactTokens($0.totalTokens)) tok" },
+            relativeAge(activity.updatedAt),
+        ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+        let usageWidth = CGFloat(usage.count) * Self.footerCharacterWidth
+        let usageX = statusX - 10 - usageWidth
+        drawText(
+            usage,
+            in: capCenteredRect(x: usageX, width: usageWidth + 1, centerY: lineY, font: Typeface.footer),
+            font: Typeface.footer,
+            color: Palette.mutedInk
+        )
+
+        var titleX = textX
+        if let nickname = activity.nickname, !nickname.isEmpty {
+            titleX = drawRoleTag(String(nickname.prefix(14)), x: textX, centerY: lineY) + 6
+        }
+        drawText(
+            activity.title,
+            in: capCenteredRect(x: titleX, width: max(40, usageX - 10 - titleX), centerY: lineY, font: Typeface.childTitle),
+            font: Typeface.childTitle,
+            color: finished ? Palette.tertiaryInk : Palette.phosphor
+        )
+        drawText(
+            prompt?.line ?? activity.detail,
+            in: NSRect(x: textX, y: rowTop - 35, width: bodyRight - textX - 10, height: 14),
+            font: Typeface.caption,
+            color: prompt != nil ? Palette.askPink : finished ? Palette.mutedInk : Palette.tertiaryInk
+        )
+    }
+
+    // one continuous guide runs from under the parent's sprite to the last visible subagent.
+    private func drawTreeGuide(for row: ActivityRow, top rowTop: CGFloat, elbowY: CGFloat, x: CGFloat) {
+        let path = NSBezierPath()
+        path.lineWidth = 1
+        path.move(to: NSPoint(x: x, y: row.isFirstChild ? rowTop + 29 : rowTop))
+        if row.isLastChild {
+            path.line(to: NSPoint(x: x, y: elbowY + 4))
+            path.curve(
+                to: NSPoint(x: x + 4, y: elbowY),
+                controlPoint1: NSPoint(x: x, y: elbowY + 1.8),
+                controlPoint2: NSPoint(x: x + 1.8, y: elbowY)
+            )
+        } else {
+            path.line(to: NSPoint(x: x, y: rowTop - row.height))
+            path.move(to: NSPoint(x: x, y: elbowY))
+        }
+        path.line(to: NSPoint(x: x + 10, y: elbowY))
+        Palette.treeGuide.setStroke()
+        path.stroke()
+    }
+
+    // returns the tag's right edge so the title can follow it.
+    private func drawRoleTag(_ text: String, x: CGFloat, centerY: CGFloat) -> CGFloat {
+        let width = (CGFloat(text.count) * Self.tagCharacterWidth + 8).rounded(.up)
+        let tag = NSRect(x: x, y: centerY - 6.5, width: width, height: 13)
+        Palette.tagFill.setFill()
+        NSBezierPath(roundedRect: tag, xRadius: 3, yRadius: 3).fill()
+        drawText(
+            text,
+            in: capCenteredRect(x: tag.minX, width: width, centerY: centerY, font: Typeface.tag),
+            font: Typeface.tag,
+            color: Palette.tertiaryInk,
+            alignment: .center
+        )
+        return tag.maxX
+    }
+
+    // a text rect whose capitals sit centered on centerY, so text lines up with sprites, tags and pills.
+    private func capCenteredRect(x: CGFloat, width: CGFloat, centerY: CGFloat, font: NSFont) -> NSRect {
+        let top = (centerY - font.capHeight / 2 + font.ascender).rounded()
+        let height = ceil(font.ascender - font.descender) + 2
+        return NSRect(x: x, y: top - height, width: width, height: height)
+    }
+
+    // returns the pill's left edge so the title can stop short of it.
+    private func drawStatusPill(_ text: String, color: NSColor, centerY: CGFloat) -> CGFloat {
+        let width = statusPillWidth(text)
+        let pill = NSRect(x: statusPillRight - width, y: centerY - 7, width: width, height: 14)
+        color.withAlphaComponent(0.16).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 7, yRadius: 7).fill()
+        drawText(
+            text,
+            in: capCenteredRect(x: pill.minX, width: width, centerY: centerY, font: Typeface.badge),
+            font: Typeface.badge,
+            color: color,
+            alignment: .center
+        )
+        return pill.minX
+    }
+
     private func drawFooter(bodyLeft: CGFloat, bodyRight: CGFloat) {
-        Palette.mutedInk.withAlphaComponent(0.3).setFill()
+        Palette.hairline.setFill()
         NSRect(x: bodyLeft + 12, y: footerHeight + 5, width: bodyRight - bodyLeft - 24, height: 1).fill()
 
-        let lines = footerLines
-        let font = Typeface.footer
-        for (index, line) in lines.enumerated() {
-            let textWidth = (line.text as NSString).size(withAttributes: [.font: font]).width
-            let iconX = max(bodyLeft + 12, (bodyLeft + bodyRight - textWidth - 18) / 2).rounded(.down)
+        let layout = footerLayout
+        let iconWidth: CGFloat = 18
+        let columnGap: CGFloat = 16
+        let columnsWidth = layout.columns.map(\.width).reduce(0, +) + columnGap * CGFloat(max(0, layout.columns.count - 1))
+        let statusWidth = layout.limitLines.compactMap { $0.status?.width }.max().map { $0 + 8 } ?? 0
+        let tableWidth = iconWidth + columnsWidth + statusWidth
+        // both providers share one centered table so their 5h and 7d columns line up.
+        let tableX = max(bodyLeft + 12, (bodyLeft + bodyRight - tableWidth) / 2).rounded(.down)
+        for (index, line) in layout.limitLines.enumerated() {
             let y = footerHeight - notificationWarningHeight - CGFloat(index + 1) * 15
-            if let agent = line.agent {
-                drawAgentSprite(agent: agent, at: NSPoint(x: iconX + 5.25, y: y + 6.75), pixel: 1.5,
-                    color: agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk, running: false)
+            drawAgentSprite(agent: line.agent, at: NSPoint(x: tableX + 5.25, y: y + 6.75), pixel: 1.5,
+                color: line.agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk, running: false)
+            var x = tableX + iconWidth
+            for (index, column) in layout.columns.enumerated() {
+                if let run = layout.run(for: line, column: index) { drawFooterRun(run, x: x, y: y) }
+                x += column.width + columnGap
             }
-            let textX = line.agent == nil ? bodyLeft + 12 : iconX + 18
-            drawText(
-                line.text,
-                in: NSRect(x: textX, y: y, width: bodyRight - textX - 12, height: 13),
-                font: font,
-                color: index < 2 ? Palette.tertiaryInk : Palette.mutedInk,
-                alignment: line.agent == nil ? .center : .left
-            )
+            if let status = line.status {
+                drawFooterRun(status, x: tableX + iconWidth + columnsWidth + 8, y: y)
+            }
+        }
+    }
+
+    private func drawFooterRun(_ run: FooterRun, x startX: CGFloat, y: CGFloat) {
+        let font = Typeface.footer
+        var x = startX
+        for (piece, width) in run.pieces {
+            switch piece {
+            case let .text(text, color):
+                drawText(text, in: NSRect(x: x, y: y, width: width + 1, height: 13), font: font, color: color)
+            case let .meter(fraction, color):
+                // sit the bar on the text's x-height so it reads as part of the line.
+                let midY = y + 13 - font.ascender + font.xHeight / 2
+                let track = NSRect(x: x, y: (midY - 1.5).rounded(), width: width, height: 3)
+                Palette.hairline.setFill()
+                NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+                color.setFill()
+                let filled = NSRect(x: track.minX, y: track.minY, width: max(1.5, track.width * CGFloat(min(1, fraction))), height: track.height)
+                NSBezierPath(roundedRect: filled, xRadius: 1.5, yRadius: 1.5).fill()
+            case let .dashes(_, color):
+                let midY = (y + 13 - font.ascender + font.xHeight / 2).rounded()
+                let dashes = NSBezierPath()
+                dashes.move(to: NSPoint(x: x, y: midY))
+                dashes.line(to: NSPoint(x: x + width, y: midY))
+                dashes.lineWidth = 1
+                dashes.setLineDash([2, 3], count: 2, phase: 0)
+                color.setStroke()
+                dashes.stroke()
+            case .space:
+                break
+            }
+            x += width
         }
     }
 
@@ -3977,9 +4455,9 @@ private final class IslandView: NSView {
         switch phase {
         case .running: return "RUNNING"
         case .delegating: return "AGENTS"
-        case .ready: return ""
+        case .ready: return "DONE"
         case .stopped: return "STOPPED"
-        case .seen: return ""
+        case .seen: return "DONE"
         }
     }
 
@@ -4370,6 +4848,11 @@ private func runSelfTest() {
     assert(parsePrompt(currentCodexResponse) == nil && parseResponse(currentCodexPrompt) == nil)
     assert(parseModel(context) == "gpt-5.6-sol/high")
     assert(parseUsage(usage)?.contextTokens == 50_000)
+    assert(surfaceLabel(.codex, source: "codex") == "desktop" && surfaceLabel(.codex, source: "extension") == "extension")
+    assert(surfaceLabel(.claude, source: "cli") == "cli" && surfaceLabel(.pi, source: "cli") == nil)
+    assert(modelDelta("gpt-5.5-codex/medium", parent: "gpt-5.5-codex/high") == "/medium")
+    assert(modelDelta("gpt-5.5-codex/high", parent: "gpt-5.5-codex/high") == nil)
+    assert(modelDelta("haiku-5.5", parent: "opus-5.5") == "haiku-5.5" && modelDelta("", parent: "opus-5.5") == nil)
     assert(agentRowLabel(.opencode) == "oc")
     assert(agentRowLabel(.opencode2) == "oc2")
     assert(agentRowLabel(.codex) == nil && agentRowLabel(.pi) == nil)
@@ -4385,8 +4868,10 @@ private func runSelfTest() {
            "A failed Claude refresh must keep both percentages and reset times")
     let staleClaudeUsage = effectiveUsage(local: nil, remote: retainedClaudeLimits,
         unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
-    assert(remainingUsageSummary(staleClaudeUsage, agent: .claude, compact: true)
-        == remainingUsageSummary(effectiveUsage(local: nil, remote: claudeLimits), agent: .claude, compact: true) + " · ⚠")
+    assert(limitCells(staleClaudeUsage, agent: .claude)
+        == limitCells(effectiveUsage(local: nil, remote: claudeLimits), agent: .claude))
+    assert(limitStatusSymbol(staleClaudeUsage) == "⚠")
+    assert(limitStatusSymbol(effectiveUsage(local: nil, remote: claudeLimits)) == nil)
     assert(staleClaudeUsage?.refreshWarning?.contains("last known limits") == true)
     assert(remainingUsageSummary(staleClaudeUsage, agent: .claude).contains("last known limits"))
     let emptyLimits = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":null}"#.utf8))
@@ -4414,17 +4899,27 @@ private func runSelfTest() {
     assert(claudeWindowLabels == ["Claude",
         "5h 87.5% left ↻ \(resetTimeFormatter.string(from: fiveHourMinute))",
         "weekly 56.75% left ↻ \(resetDateFormatter.string(from: weeklyMinute)) \(resetTimeFormatter.string(from: weeklyMinute))"])
-    assert(remainingUsageSummary(claudeAccountUsage, agent: .claude, compact: true) ==
-        "5h 87.5% ↻ \(resetTimeFormatter.string(from: fiveHourMinute)) · 7d 56.75% ↻ \(resetDateFormatter.string(from: weeklyMinute)) \(resetTimeFormatter.string(from: weeklyMinute))")
+    assert(limitCells(claudeAccountUsage, agent: .claude) == [
+        LimitCell(label: "5h", windowMinutes: 300, remainingPercent: 87.5, reset: resetTimeFormatter.string(from: fiveHourMinute)),
+        LimitCell(label: "7d", windowMinutes: 10_080, remainingPercent: 56.75,
+            reset: "\(resetDateFormatter.string(from: weeklyMinute)) \(resetTimeFormatter.string(from: weeklyMinute))"),
+    ])
+    assert(limitLevel(remainingPercent: 56.75) == .normal)
+    assert(limitLevel(remainingPercent: 25) == .low && limitLevel(remainingPercent: 11) == .low)
+    assert(limitLevel(remainingPercent: 10) == .critical && limitLevel(remainingPercent: 0) == .critical)
     let weeklyOnly = parseClaudeUsageResponse(Data(#"{"five_hour":null,"seven_day":{"utilization":35}}"#.utf8))
     assert(remainingUsageSummary(effectiveUsage(local: nil, remote: weeklyOnly), agent: .claude)
         == "Claude · 5h unavailable · weekly 65% left")
     assert(remainingUsageSummary(nil, agent: .claude) == "Claude · 5h unavailable · weekly unavailable")
-    assert(remainingUsageSummary(nil, agent: .claude, compact: true) == "5h — · 7d —")
+    let unavailableClaudeCells = [
+        LimitCell(label: "5h", windowMinutes: 300, remainingPercent: nil, reset: nil),
+        LimitCell(label: "7d", windowMinutes: 10_080, remainingPercent: nil, reset: nil),
+    ]
+    assert(limitCells(nil, agent: .claude) == unavailableClaudeCells)
     let lockedClaudeUsage = UsageSnapshot(totalTokens: 0, contextTokens: 0, contextWindow: 0,
         primaryLimit: nil, secondaryLimit: nil, costTotal: nil, unavailableReason: "Keychain approval needed")
-    assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude, compact: true) == "5h — · 7d — · 🔒",
-           "Unavailable Claude usage must identify the Keychain blocker")
+    assert(limitCells(lockedClaudeUsage, agent: .claude) == unavailableClaudeCells)
+    assert(limitStatusSymbol(lockedClaudeUsage) == "🔒", "Unavailable Claude usage must identify the Keychain blocker")
     assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude).contains("Keychain approval needed"))
     assert(effectiveUsage(local: nil, remote: nil, unavailableReason: "Keychain approval needed") == lockedClaudeUsage)
     assert(claudeUsageFailure(statusCode: 200, limits: claudeLimits) == nil)
@@ -4436,9 +4931,27 @@ private func runSelfTest() {
     assert(claudeUsageFailure(statusCode: nil, limits: nil)?.contains("connection") == true)
     let failedClaudeUsage = effectiveUsage(local: nil, remote: nil,
         unavailableReason: claudeUsageFailure(statusCode: 429, limits: nil))
-    assert(remainingUsageSummary(failedClaudeUsage, agent: .claude, compact: true) == "5h — · 7d — · ⚠")
+    assert(limitCells(failedClaudeUsage, agent: .claude) == unavailableClaudeCells)
+    assert(limitStatusSymbol(failedClaudeUsage) == "⚠")
 
-    assert(remainingUsageSummary(nil, compact: true) == "—")
+    assert(limitCells(nil, agent: .codex).isEmpty)
+    // pro plans report only a weekly window, in the primary slot.
+    let weeklyOnlyCodex = effectiveUsage(local: nil, remote: RemoteRateLimits(
+        primary: RateLimitUsage(usedPercent: 57, windowMinutes: 10_080, resetsAt: nil), secondary: nil))
+    assert(limitCells(weeklyOnlyCodex, agent: .codex) == [LimitCell(label: "7d", windowMinutes: 10_080, remainingPercent: 43, reset: nil)])
+    assert(remainingUsageSummary(weeklyOnlyCodex) == "Codex · weekly 43% left")
+    let proLines = [footerLimitLine(weeklyOnlyCodex, agent: .codex), footerLimitLine(claudeAccountUsage, agent: .claude)]
+    let proFooter = FooterLayout(limitLines: proLines, columns: footerColumns(for: proLines))
+    assert(proFooter.columns.map(\.minutes) == [300, 10_080], "Windows must line up by length, not position")
+    assert(proFooter.run(for: proLines[0], column: 0)?.text == "5h no limit")
+    assert(abs((proFooter.run(for: proLines[0], column: 0)?.width ?? 0) - proFooter.columns[0].width) < 0.5,
+           "A missing window must fill its column instead of leaving a gap")
+    assert(proFooter.run(for: proLines[0], column: 1)?.text == "7d 43%")
+    assert(proFooter.run(for: proLines[1], column: 0)?.text.hasPrefix("5h 87.5%") == true)
+    let unloadedLines = [footerLimitLine(nil, agent: .codex), footerLimitLine(claudeAccountUsage, agent: .claude)]
+    let unloadedFooter = FooterLayout(limitLines: unloadedLines, columns: footerColumns(for: unloadedLines))
+    assert(unloadedFooter.run(for: unloadedLines[0], column: 0)?.text == "—")
+    assert(unloadedFooter.run(for: unloadedLines[0], column: 1) == nil)
     assert(parseClaudeUsageResponse(Data(#"{"error":"unauthorized"}"#.utf8)) == nil)
     assert(parseClaudeUsageResponse(Data("broken json".utf8)) == nil)
     let invalidWindows = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"35"}}"#.utf8))
@@ -4818,8 +5331,6 @@ private func runSelfTest() {
     assert(finished?.usage?.totalTokens == 5_000)
     assert(finished?.usage?.costTotal == 0.5)
     assert(usageSummary(finished?.usage) == "ctx 50% · 5k tok")
-    assert(piUsageSummary(latest).contains("pi 5k tok"))
-    assert(piUsageSummary(latest).contains("$0.50"))
     piMonitor.acknowledge(codexSources: ["cli"], piSources: ["cli"], opencodeSources: [])
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "pi-test" }?.phase == .seen })
 
@@ -4933,7 +5444,6 @@ private func runSelfTest() {
     assert(ocFinished?.usage?.contextTokens == 460)
     assert(ocFinished?.usage?.costTotal == 0.0123)
     assert(usageSummary(ocFinished?.usage) == "4k tok")
-    assert(agentUsageSummary(latest) == "oc 4k tok · $0.01")
 
     opencodeExecute("""
     UPDATE session_message SET data = '{"model":{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"},"content":[{"type":"reasoning","text":"thinking"},{"type":"tool","state":{"status":"completed"}},{"type":"text","text":"Done. v2 shipped."}],"time":{"created":\(nowMs - 1000),"completed":\(nowMs + 2000)},"finish":"stop","tokens":{"input":100,"output":50,"reasoning":0,"cache":{"read":300,"write":10}},"cost":0.01}', time_updated = \(nowMs + 2000) WHERE id = 'v2m2';
@@ -4947,7 +5457,6 @@ private func runSelfTest() {
     assert(oc2Finished?.usage?.totalTokens == 30)
     assert(oc2Finished?.usage?.contextTokens == 460)
     assert(oc2Finished?.usage?.costTotal == 0.02)
-    assert(agentUsageSummary(latest, agent: .opencode2) == "oc2 30 tok · $0.02")
     ocMonitor.acknowledge(codexSources: [], piSources: [], opencodeSources: ["cli"])
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_oc-1" }?.phase == .seen })
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .seen })
@@ -5311,6 +5820,7 @@ private func runClaudeSelfTest() {
     assert(waitUntil(timeout: 3) { groupActivities(latest).first { $0.root.id == "claude-test" }?.phase == .delegating })
     assert(completions.isEmpty)
     assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentSummary == "2 subagents · 2 running")
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentBadge == "2/2 running")
     monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
     append(record(["type": "user", "message": ["content": [["type": "tool_result", "tool_use_id": "spawn-child", "content": "Started"]]],
         "toolUseResult": ["agentId": "child", "description": "Map preparation/publication pipeline"]]))
@@ -5319,6 +5829,7 @@ private func runClaudeSelfTest() {
     append(handback + handbackResult, to: childFile)
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "claude-test:agent:child" }?.phase == .ready })
     assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentSummary == "2 subagents · 1 running · 1 done")
+    assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.subagentBadge == "1/2 running")
     assert(groupActivities(latest).first { $0.root.id == "claude-test" }?.children.first?.phase == .running,
            "Active subagents must stay above completed children")
     assert(completions.isEmpty)
@@ -5331,7 +5842,6 @@ private func runClaudeSelfTest() {
     let finished = latest.first { $0.id == "claude-test" }
     assert(finished?.agent == .claude && finished?.source == "cli" && finished?.detail == "All done.")
     assert(finished?.prompt == nil && finished?.usage?.totalTokens == 378)
-    assert(agentUsageSummary([finished!], agent: .claude) == "claude 378 tok")
     monitor.acknowledge(codexSources: [], piSources: [], opencodeSources: [], claudeSources: ["cli"])
     assert(waitUntil { latest.first { $0.id == "claude-test" }?.phase == .seen })
     assert(latest.first { $0.id == "desktop-test" }?.phase == .ready)
