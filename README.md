@@ -1,10 +1,28 @@
-# notchtail
+<p align="center">
+  <img src="App/Resources/AppIcon.png" alt="notchtail app icon" width="128">
+</p>
+
+<h1 align="center">notchtail</h1>
+
+<p align="center">
+  <img src="docs/images/hero.png" alt="notchtail expanded under the MacBook Pro notch, listing Codex, Claude Code, opencode, and Pi sessions with their subagents and account limits" width="880">
+  <br>
+  <sub>Rendered from the app's own drawing code with sample sessions.</sub>
+</p>
 
 A tiny native macOS status island for Codex, Claude Code (CLI and local Desktop Code sessions), Pi, and **opencode** (v1 and v2 sessions). Agent icons move across the notch while a local turn is running, turn green when complete, orange-red when stopped, and expand on hover (after a brief pause, so a pointer passing by on its way to the menu bar leaves it closed) or click to show sessions with a status pill (`RUNNING`, `AGENTS`, `ASKING`, `DONE`, `STOPPED`), latest response, model, context/token usage, source, project, and grouped subagents. Collapsed, the two sides of the notch mirror each other: the left says who (the running count, or the agent that finished, stopped, or is asking) and the right says what (agents moving across, a green ✓, an orange ✕, or a pink **?**). Idle shows a dim dot on each side. Up to five threads are listed; a `+N more` line counts any that don't fit. Codex uses its circular terminal logo and reads saved thread names from its state database and session index, falling back to the latest prompt when unnamed. Saved names refresh while the app is running.
+
+<p align="center">
+  <img src="docs/images/states.png" alt="The collapsed island in four states: two agents running, Claude asking a question, Codex done, and opencode stopped" width="760">
+</p>
 
 When an agent asks you something — a Claude question or plan approval, an opencode question or permission dialog, a pi ask or approval tool, or a Codex persisted approval/input request — the island shows the asking agent's sprite on the left of the notch and a pink pulsing **?** on the right (read-only; answer in the agent's own surface), the row's status turns `ASKING` with the question or the command waiting for approval, and a distinct `Ping` notification sound fires once per ask. Asking threads sort to the top and are exempt from the inactivity stop timeout while they wait on you. Approval variants that a provider keeps only in its live protocol stream remain unavailable to this read-only monitor.
 
 Parent threads stay active while their subagents run, even after the parent finishes its own turn. Completion notifications wait for the last subagent. Active subagents expand automatically beneath the parent as compact two-line rows on a tree: role (e.g. `explorer`), task name, tokens, age, and status, then the current action. A subagent's model appears only where it differs from the parent's (often just the reasoning level, e.g. `/medium`), and finished subagents dim. The parent keeps its own latest response, and its agent-count button shows how many subagents are still running (e.g. `1/2 running`). The button turns pink while a subagent is asking, and a new ask reopens a collapsed group. Hover the button for running, asking, and finished counts; click it to collapse or expand the group. Claude subagents also recognize successful `SubagentHandback` results as completion.
+
+<p align="center">
+  <img src="docs/images/expanded.png" alt="Close-up of the expanded island: a Codex thread with three subagents on a tree, one asking for approval, a Claude thread with two subagents, and the shared limits footer" width="460">
+</p>
 
 The expanded footer keeps remaining account-wide limits and reset times visible even when no session is active. Agent icons identify the **Codex** and **Claude** rows, which line their windows up in shared columns; `5h` and `7d` show a small meter and the percentage remaining, followed by `↻` and the local reset time. A window turns yellow at 25% remaining and orange-red at 10%. Weekly resets always include the calendar date. Plans that report only a weekly limit (such as ChatGPT Pro) show `5h no limit` in Codex's row; a dash is reserved for limits that couldn't be loaded. Codex and Claude token counts appear in each thread's details. Claude's API cost estimates are omitted. A dash marks unavailable limits; a lock identifies blocked Keychain access and a warning identifies other fetch failures. Hover for the reason and next step. Screen readers retain the full provider and remaining-usage labels.
 
