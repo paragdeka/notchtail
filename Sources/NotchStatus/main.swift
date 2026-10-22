@@ -1064,6 +1064,63 @@ private func opencodeColumnString(_ statement: OpaquePointer?, _ index: Int32) -
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+// size + mtime is enough to tell whether a file needs re-reading without opening it.
+private struct FileStamp: Equatable {
+    let size: UInt64
+    let modified: Date
+
+    init?(_ url: URL) {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.uint64Value,
+              let modified = attributes[.modificationDate] as? Date else { return nil }
+        self.size = size
+        self.modified = modified
+    }
+}
+
+private func sqliteStamps(_ databaseURL: URL) -> [FileStamp?] {
+    [FileStamp(databaseURL), FileStamp(URL(fileURLWithPath: databaseURL.path + "-wal"))]
+}
+
+// rollout paths among `candidates` that some process of this user has open.
+// matched by device and inode because the kernel reports /private-prefixed paths.
+private func filesHeldOpen(_ candidates: Set<String>) -> Set<String> {
+    var wanted: [String: String] = [:]
+    for path in candidates {
+        var info = stat()
+        if stat(path, &info) == 0 { wanted["\(UInt32(truncatingIfNeeded: info.st_dev)):\(info.st_ino)"] = path }
+    }
+    guard !wanted.isEmpty else { return [] }
+
+    let capacity = proc_listallpids(nil, 0)
+    guard capacity > 0 else { return [] }
+    var pids = [pid_t](repeating: 0, count: Int(capacity) + 64)
+    let listed = pids.withUnsafeMutableBytes {
+        proc_listallpids($0.baseAddress, Int32($0.count))
+    }
+    var held = Set<String>()
+    for pid in pids.prefix(Int(max(0, listed))) where pid > 0 {
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { continue }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride + 8)
+        let used = fds.withUnsafeMutableBytes {
+            proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count))
+        }
+        for fd in fds.prefix(Int(max(0, used)) / MemoryLayout<proc_fdinfo>.stride)
+        where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+            var vnode = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &vnode, size) == size else { continue }
+            let stat = vnode.pvip.vip_vi.vi_stat
+            if let path = wanted["\(UInt32(truncatingIfNeeded: stat.vst_dev)):\(stat.vst_ino)"] {
+                held.insert(path)
+                if held.count == wanted.count { return held }
+            }
+        }
+    }
+    return held
+}
+
 private final class SessionMonitor {
     private struct Cursor {
         var offset: UInt64
@@ -1130,6 +1187,18 @@ private final class SessionMonitor {
     private let claudeUsageSession = URLSession(configuration: .ephemeral)
     private var expiryWorkItem: DispatchWorkItem?
     private var reconciliationTimer: DispatchSourceTimer?
+    private var reconciliationInterval: TimeInterval = 0
+    private var lastDiscoveryAt = Date.distantPast
+    private var titlesStamps: [FileStamp?]?
+    private var indexTitlesCache: (stamp: FileStamp?, titles: [String: String])?
+    private var opencodeStoresStamps: [[FileStamp?]]?
+    // files not worth reading again until they grow: metadata not written yet,
+    // or idle sessions retired from the cursor set.
+    private var skipUntilGrowth: [String: UInt64] = [:]
+    private var abandonedCodexKeys: Set<String> = []
+    private var lastLivenessCheckAt = Date.distantPast
+    private var opencodeRecheckWorkItem: DispatchWorkItem?
+    private var readConnections: [String: (fileNumber: UInt64, database: OpaquePointer)] = [:]
     private var generation: UInt = 0
     private var active = false
     private let lifecycleLock = NSLock()
@@ -1177,9 +1246,12 @@ private final class SessionMonitor {
         }
         queue.async { [self] in
             guard active, generation == startGeneration else { return }
-            titles = loadTitles()
+            titlesStamps = nil
+            opencodeStoresStamps = nil
+            refreshCodexTitles()
             piContextWindows = loadPiContextWindows()
             bootstrap()
+            lastDiscoveryAt = Date()
             _ = reconcileOpencode()
             startEventStreams()
             startReconciliationTimer()
@@ -1197,6 +1269,10 @@ private final class SessionMonitor {
             lifecycleActive = false
             lifecycleLock.unlock()
             expiryWorkItem?.cancel()
+            opencodeRecheckWorkItem?.cancel()
+            opencodeRecheckWorkItem = nil
+            for connection in readConnections.values { sqlite3_close(connection.database) }
+            readConnections.removeAll()
             reconciliationTimer?.cancel()
             reconciliationTimer = nil
             accountUsageTask?.cancel()
@@ -1236,8 +1312,9 @@ private final class SessionMonitor {
     }
 
     private func bootstrap() {
+        // one pool per file: startup parses dozens of sessions in a single queue block.
         for path in recentSessionPaths() {
-            _ = register(path)
+            autoreleasepool { _ = register(path) }
         }
     }
 
@@ -1379,34 +1456,126 @@ private final class SessionMonitor {
 
     private func startReconciliationTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
         timer.setEventHandler { [weak self] in self?.reconcile() }
-        timer.resume()
         reconciliationTimer = timer
+        reconciliationInterval = 0
+        updateReconciliationCadence()
+        timer.resume()
+    }
+
+    // fsevents deliver every session, title and opencode write (opencode permission
+    // debounces get a one-shot recheck), so the timer only covers state without a
+    // file signal: silent turn timeouts, dead codex processes and account usage.
+    private var desiredReconciliationInterval: TimeInterval {
+        activities.values.contains { $0.phase == .running } ? 10 : 30
+    }
+
+    private func updateReconciliationCadence() {
+        guard let timer = reconciliationTimer else { return }
+        let interval = desiredReconciliationInterval
+        guard interval != reconciliationInterval else { return }
+        reconciliationInterval = interval
+        timer.schedule(
+            deadline: .now() + interval,
+            repeating: interval,
+            leeway: .milliseconds(Int(interval * 250))
+        )
     }
 
     private func reconcile() {
-        var changed = false
-        let refreshedTitles = loadTitles()
-        if refreshedTitles != titles {
-            titles = refreshedTitles
-            for cursor in cursors.values where cursor.meta.agent == .codex {
-                guard let previous = activities[cursor.meta.key] else { continue }
-                let updated = activity(for: cursor.meta, phase: previous.phase, at: previous.updatedAt)
-                if previous != updated {
-                    activities[cursor.meta.key] = updated
-                    changed = true
-                }
-            }
+        var changed = refreshCodexTitles()
+        // backstop for missed fsevents and roots created after launch.
+        var paths = Set(cursors.keys)
+        if Date().timeIntervalSince(lastDiscoveryAt) >= 60 {
+            lastDiscoveryAt = Date()
+            retireIdleCursors()
+            paths = Set(cursors.keys).union(recentSessionPaths())
         }
-        for path in Set(recentSessionPaths()).union(cursors.keys) {
+        for path in paths {
             changed = (cursors[path] == nil ? register(path) : readAppendedEvents(from: path)) || changed
         }
         changed = reconcileOpencode() || changed
         changed = stopOrphanedTurns() || changed
+        changed = stopAbandonedCodexTurns() || changed
         refreshCodexAccountUsageIfNeeded()
         refreshClaudeAccountUsageIfNeeded()
         if changed { publish() }
+        updateReconciliationCadence()
+    }
+
+    // sessions that left the island and sat idle past the discovery window are
+    // dropped; fsevents register them again if they are ever written.
+    private func retireIdleCursors() {
+        let cutoff = Date().addingTimeInterval(-2 * 86_400)
+        for (path, cursor) in cursors where activities[cursor.meta.key] == nil {
+            let stamp = FileStamp(URL(fileURLWithPath: path))
+            if let stamp {
+                guard stamp.modified < cutoff else { continue }
+                skipUntilGrowth[path] = stamp.size
+            }
+            cursors.removeValue(forKey: path)
+            let key = cursor.meta.key
+            responses.removeValue(forKey: key)
+            prompts.removeValue(forKey: key)
+            models.removeValue(forKey: key)
+            usages.removeValue(forKey: key)
+            piBaseModels.removeValue(forKey: key)
+            piProviders.removeValue(forKey: key)
+            thinkingLevels.removeValue(forKey: key)
+            piSessionNames.removeValue(forKey: key)
+            piTotals.removeValue(forKey: key)
+            claudeSessions.removeValue(forKey: key)
+            codexOpenPrompts.removeValue(forKey: key)
+        }
+    }
+
+    // the codex app server keeps every loaded thread's rollout open, so a running
+    // turn whose rollout no process holds can never finish. without this a crashed
+    // codex keeps the island animating until the six-hour silence timeout.
+    private func stopAbandonedCodexTurns() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastLivenessCheckAt) >= 30 else { return false }
+        let silent = cursors.filter { path, cursor in
+            guard cursor.meta.agent == .codex,
+                  let activity = activities[cursor.meta.key],
+                  activity.phase == .running, activity.prompt == nil,
+                  let stamp = FileStamp(URL(fileURLWithPath: path)) else { return false }
+            return now.timeIntervalSince(stamp.modified) >= 120
+        }
+        guard !silent.isEmpty else { return false }
+        lastLivenessCheckAt = now
+        let held = filesHeldOpen(Set(silent.keys))
+        var changed = false
+        for (path, cursor) in silent where !held.contains(path) {
+            guard var activity = activities[cursor.meta.key] else { continue }
+            activity.phase = .stopped
+            activity.updatedAt = now
+            activities[cursor.meta.key] = activity
+            abandonedCodexKeys.insert(cursor.meta.key)
+            changed = true
+        }
+        return changed
+    }
+
+    @discardableResult
+    private func refreshCodexTitles() -> Bool {
+        let stamps = [FileStamp(codexHome.appendingPathComponent("session_index.jsonl"))]
+            + (codexStateDatabaseURL.map(sqliteStamps) ?? [])
+        guard stamps != titlesStamps else { return false }
+        titlesStamps = stamps
+        let refreshedTitles = loadTitles()
+        guard refreshedTitles != titles else { return false }
+        titles = refreshedTitles
+        var changed = false
+        for cursor in cursors.values where cursor.meta.agent == .codex {
+            guard let previous = activities[cursor.meta.key] else { continue }
+            let updated = activity(for: cursor.meta, phase: previous.phase, at: previous.updatedAt)
+            if previous != updated {
+                activities[cursor.meta.key] = updated
+                changed = true
+            }
+        }
+        return changed
     }
 
     private func stopOrphanedTurns() -> Bool {
@@ -1466,15 +1635,27 @@ private struct OpencodeSessionRow {
 
     private func reconcileOpencode() -> Bool {
         tailOpencodeLog()
-        return opencodeStores.reduce(false) { changed, store in
-            guard FileManager.default.fileExists(atPath: store.databaseURL.path) else { return changed }
-            return (withReadOnlyDatabase(store.databaseURL) { database in
-                let legacyChanged = readOpencodeSessions(database, agent: .opencode, table: "session", schema: .v1)
-                let v2Changed = readOpencodeSessions(database, agent: .opencode2, table: "session_v2", schema: .v2)
+        let stores = opencodeStores
+        let stamps = stores.map { sqliteStamps($0.databaseURL) }
+        let storesChanged = stamps != opencodeStoresStamps
+        let promptsPending = activities.values.contains {
+            $0.phase == .running && ($0.agent == .opencode || $0.agent == .opencode2)
+        }
+        guard storesChanged || promptsPending else { return false }
+        opencodeStoresStamps = stamps
+        var changed = false
+        for store in stores where FileManager.default.fileExists(atPath: store.databaseURL.path) {
+            let storeChanged = withReadOnlyDatabase(store.databaseURL) { database in
+                let legacyChanged = storesChanged && readOpencodeSessions(database, agent: .opencode, table: "session", schema: .v1)
+                let v2Changed = storesChanged && readOpencodeSessions(database, agent: .opencode2, table: "session_v2", schema: .v2)
                 let promptChanged = refreshOpencodePrompts(database)
                 return legacyChanged || v2Changed || promptChanged
-            } ?? false) || changed
+            }
+            // an unreadable store must be retried on the next pass even without a new write.
+            if storeChanged == nil { opencodeStoresStamps = nil }
+            changed = (storeChanged ?? false) || changed
         }
+        return changed
     }
 
     private func tailOpencodeLog() {
@@ -1506,16 +1687,25 @@ private struct OpencodeSessionRow {
         }
     }
 
+    // connections stay open between passes (opening re-reads the schema each time);
+    // a replaced file has a new file number and gets a fresh connection.
     private func withReadOnlyDatabase<T>(_ url: URL, _ body: (OpaquePointer) -> T?) -> T? {
+        let path = url.path
+        let fileNumber = ((try? FileManager.default.attributesOfItem(atPath: path))?[.systemFileNumber] as? NSNumber)?.uint64Value
+        if let cached = readConnections[path] {
+            if cached.fileNumber == fileNumber { return body(cached.database) }
+            sqlite3_close(cached.database)
+            readConnections.removeValue(forKey: path)
+        }
+        guard let fileNumber else { return nil }
         var database: OpaquePointer?
-        let result = sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil)
-        guard result == SQLITE_OK else {
+        let result = sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY, nil)
+        guard result == SQLITE_OK, let database else {
             if let database { sqlite3_close(database) }
             return nil
         }
-        guard let database else { return nil }
-        defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, 300)
+        readConnections[path] = (fileNumber, database)
         return body(database)
     }
 
@@ -1844,7 +2034,8 @@ private struct OpencodeSessionRow {
     }
 
     private func startEventStreams() {
-        for root in [sessionsRoot, piSessionsRoot, claudeProjectsRoot]
+        // codex home (not just sessions) so saved thread names arrive as events too.
+        for root in [codexHome, piSessionsRoot, claudeProjectsRoot, opencodeDataDirectory]
         where FileManager.default.fileExists(atPath: root.path) {
             startEventStream(forRoot: root)
         }
@@ -1884,31 +2075,83 @@ private struct OpencodeSessionRow {
     }
 
     private func consume(_ paths: [String]) {
-        var changed = false
-        let visibleIDs = Set(activities.keys)
-        let pathsToRefresh = Set(paths.filter { $0.hasSuffix(".jsonl") }
-            .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }).union(
-            cursors.compactMap { visibleIDs.contains($0.value.meta.key) ? $0.key : nil }
-        )
+        var sessionPaths = Set<String>()
+        var titlesTouched = false
+        var opencodeTouched = false
+        for rawPath in paths {
+            // resolve the parent: deleted files (sqlite journals) keep their /private prefix otherwise.
+            let url = URL(fileURLWithPath: rawPath)
+            let path = url.deletingLastPathComponent().resolvingSymlinksInPath()
+                .appendingPathComponent(url.lastPathComponent).path
+            if path.hasPrefix(watchedPaths.opencode) {
+                opencodeTouched = true
+            } else if path.hasSuffix(".jsonl"), watchedPaths.sessions.contains(where: { path.hasPrefix($0) }) {
+                sessionPaths.insert(path)
+            } else if (path as NSString).deletingLastPathComponent == watchedPaths.codexHome {
+                let name = (path as NSString).lastPathComponent
+                if name == "session_index.jsonl" || name.hasPrefix("state_") { titlesTouched = true }
+            }
+        }
 
-        for path in pathsToRefresh {
-            if cursors[path] == nil {
-                changed = register(path) || changed
-            } else {
-                changed = readAppendedEvents(from: path) || changed
+        var changed = false
+        if titlesTouched { changed = refreshCodexTitles() || changed }
+        if opencodeTouched {
+            changed = reconcileOpencode() || changed
+            scheduleOpencodePromptRecheck()
+        }
+        if !sessionPaths.isEmpty {
+            let visibleIDs = Set(activities.keys)
+            sessionPaths.formUnion(cursors.compactMap { visibleIDs.contains($0.value.meta.key) ? $0.key : nil })
+            for path in sessionPaths {
+                if cursors[path] == nil {
+                    changed = register(path) || changed
+                } else {
+                    changed = readAppendedEvents(from: path) || changed
+                }
             }
         }
 
         if changed { publish() }
     }
 
+    // a permission ask only counts after a quiet debounce, which no file event
+    // marks, so re-check once it elapses after the latest opencode write.
+    private func scheduleOpencodePromptRecheck() {
+        opencodeRecheckWorkItem?.cancel()
+        opencodeRecheckWorkItem = nil
+        guard activities.values.contains(where: {
+            $0.phase == .running && ($0.agent == .opencode || $0.agent == .opencode2)
+        }) else { return }
+        let callbackGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.active, self.generation == callbackGeneration else { return }
+            if self.reconcileOpencode() { self.publish() }
+        }
+        opencodeRecheckWorkItem = work
+        queue.asyncAfter(deadline: .now() + opencodePromptDebounce + 0.5, execute: work)
+    }
+
+    private lazy var watchedPaths: (codexHome: String, sessions: [String], opencode: String) = {
+        func resolved(_ url: URL) -> String { url.resolvingSymlinksInPath().path }
+        return (
+            resolved(codexHome),
+            [sessionsRoot, piSessionsRoot, claudeProjectsRoot].map { resolved($0) + "/" },
+            resolved(opencodeDataDirectory) + "/"
+        )
+    }()
+
     @discardableResult
     private func register(_ path: String) -> Bool {
-        guard var meta = readMeta(at: path),
-              let values = try? URL(fileURLWithPath: path).resourceValues(
+        guard let values = try? URL(fileURLWithPath: path).resourceValues(
                 forKeys: [.fileSizeKey, .contentModificationDateKey]
               ),
-              let fileSize = values.fileSize else { return false }
+              let fileSize = values.fileSize,
+              skipUntilGrowth[path] != UInt64(fileSize) else { return false }
+        guard var meta = readMeta(at: path) else {
+            skipUntilGrowth[path] = UInt64(fileSize)
+            return false
+        }
+        skipUntilGrowth.removeValue(forKey: path)
 
         if meta.agent == .codex { meta.source = currentSource(for: meta) }
         if meta.agent == .claude {
@@ -1993,106 +2236,113 @@ private struct OpencodeSessionRow {
               let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return false }
 
         defer { try? handle.close() }
+        var changed = false
+        // a write proves the liveness check wrong; resume the turn until its own end event.
+        if abandonedCodexKeys.remove(cursor.meta.key) != nil, activities[cursor.meta.key]?.phase == .stopped {
+            activities[cursor.meta.key] = activity(for: cursor.meta, phase: .running, at: Date())
+            changed = true
+        }
         do {
             try handle.seek(toOffset: cursor.offset)
-            guard let appended = try handle.readToEnd() else { return false }
-            cursor.offset = size
-            cursor.remainder.append(appended)
+            // bounded chunks keep the first read of a multi-gigabyte session out of memory.
+            while cursor.offset < size, let appended = try handle.read(upToCount: 4 * 1024 * 1024), !appended.isEmpty {
+                cursor.offset += UInt64(appended.count)
+                cursor.remainder.append(appended)
 
-            let endsWithNewline = cursor.remainder.last == 0x0A
-            let parts = cursor.remainder.split(separator: 0x0A, omittingEmptySubsequences: false)
-            let completeCount = endsWithNewline ? parts.count : max(0, parts.count - 1)
-            var changed = false
+                let endsWithNewline = cursor.remainder.last == 0x0A
+                let parts = cursor.remainder.split(separator: 0x0A, omittingEmptySubsequences: false)
+                let completeCount = endsWithNewline ? parts.count : max(0, parts.count - 1)
 
-            for part in parts.prefix(completeCount) {
-                let line = Data(part)
-                if cursor.meta.agent == .claude {
-                    changed = applyClaudeLine(line, for: &cursor.meta, notify: notify) || changed
-                    continue
-                }
-                if cursor.meta.agent == .pi {
-                    changed = applyPiEvent(parsePiEvent(line), for: cursor.meta) || changed
-                    let calls = parsePiToolCalls(line)
-                    let resolved = parsePiToolResultID(line)
-                    if calls != nil || resolved != nil {
-                        changed = applyPiToolEvent(calls: calls, resolved: resolved, for: cursor.meta) || changed
+                for part in parts.prefix(completeCount) {
+                    let line = Data(part)
+                    if cursor.meta.agent == .claude {
+                        changed = applyClaudeLine(line, for: &cursor.meta, notify: notify) || changed
+                        continue
                     }
-                    continue
-                }
-                if cursor.meta.agent == .codex {
-                    let key = cursor.meta.key
-                    if let pending = parseCodexPendingPrompt(line) {
-                        codexOpenPrompts[key, default: [:]][pending.callID] = pending
-                        agentPrompts[key] = pending
-                        changed = refreshActivity(for: cursor.meta) || changed
-                        if let activity = activities[key], !promptedIDs.contains(pending.callID) {
-                            promptedIDs.insert(pending.callID)
-                            dispatchAsking(activity)
+                    if cursor.meta.agent == .pi {
+                        changed = applyPiEvent(parsePiEvent(line), for: cursor.meta) || changed
+                        let calls = parsePiToolCalls(line)
+                        let resolved = parsePiToolResultID(line)
+                        if calls != nil || resolved != nil {
+                            changed = applyPiToolEvent(calls: calls, resolved: resolved, for: cursor.meta) || changed
                         }
-                    } else if let resolved = parseCodexResolvedCallID(line) {
-                        codexOpenPrompts[key]?.removeValue(forKey: resolved)
-                        let prompt = codexOpenPrompts[key]?.values.sorted { $0.callID < $1.callID }.first
-                        agentPrompts[key] = prompt
+                        continue
+                    }
+                    if cursor.meta.agent == .codex {
+                        let key = cursor.meta.key
+                        if let pending = parseCodexPendingPrompt(line) {
+                            codexOpenPrompts[key, default: [:]][pending.callID] = pending
+                            agentPrompts[key] = pending
+                            changed = refreshActivity(for: cursor.meta) || changed
+                            if let activity = activities[key], !promptedIDs.contains(pending.callID) {
+                                promptedIDs.insert(pending.callID)
+                                dispatchAsking(activity)
+                            }
+                        } else if let resolved = parseCodexResolvedCallID(line) {
+                            codexOpenPrompts[key]?.removeValue(forKey: resolved)
+                            let prompt = codexOpenPrompts[key]?.values.sorted { $0.callID < $1.callID }.first
+                            agentPrompts[key] = prompt
+                            changed = refreshActivity(for: cursor.meta) || changed
+                        }
+                    }
+                    if let prompt = parsePrompt(line) {
+                        prompts[cursor.meta.key] = prompt
                         changed = refreshActivity(for: cursor.meta) || changed
+                        continue
                     }
-                }
-                if let prompt = parsePrompt(line) {
-                    prompts[cursor.meta.key] = prompt
-                    changed = refreshActivity(for: cursor.meta) || changed
-                    continue
-                }
-                if let response = parseResponse(line) {
-                    responses[cursor.meta.key] = response
-                    changed = refreshActivity(for: cursor.meta) || changed
-                    continue
-                }
-                if let model = parseModel(line) {
-                    models[cursor.meta.key] = model
-                    changed = refreshActivity(for: cursor.meta) || changed
-                    continue
-                }
-                if let usage = parseUsage(line) {
-                    usages[cursor.meta.key] = usage
-                    nativeUsage = usage
-                    nativeUsageUpdatedAt = Date()
-                    _ = refreshActivity(for: cursor.meta)
+                    if let response = parseResponse(line) {
+                        responses[cursor.meta.key] = response
+                        changed = refreshActivity(for: cursor.meta) || changed
+                        continue
+                    }
+                    if let model = parseModel(line) {
+                        models[cursor.meta.key] = model
+                        changed = refreshActivity(for: cursor.meta) || changed
+                        continue
+                    }
+                    if let usage = parseUsage(line) {
+                        usages[cursor.meta.key] = usage
+                        nativeUsage = usage
+                        nativeUsageUpdatedAt = Date()
+                        _ = refreshActivity(for: cursor.meta)
+                        changed = true
+                        continue
+                    }
+                    guard let event = parseTurnEvent(line) else { continue }
+                    refreshCodexTitles()
+                    switch event {
+                    case .started:
+                        cursor.meta.source = currentSource(for: cursor.meta)
+                        responses.removeValue(forKey: cursor.meta.key)
+                        prompts.removeValue(forKey: cursor.meta.key)
+                        models.removeValue(forKey: cursor.meta.key)
+                        usages.removeValue(forKey: cursor.meta.key)
+                        codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                        agentPrompts.removeValue(forKey: cursor.meta.key)
+                        activities[cursor.meta.key] = activity(for: cursor.meta, phase: .running, at: Date())
+                    case .completed:
+                        codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                        agentPrompts.removeValue(forKey: cursor.meta.key)
+                        let completed = activity(for: cursor.meta, phase: .ready, at: Date())
+                        if activities[cursor.meta.key]?.phase == .running, cursor.meta.parentID == nil {
+                            pendingCompletions.insert(completed.key)
+                        }
+                        activities[cursor.meta.key] = completed
+                    case .cancelled:
+                        codexOpenPrompts.removeValue(forKey: cursor.meta.key)
+                        agentPrompts.removeValue(forKey: cursor.meta.key)
+                        activities[cursor.meta.key] = activity(for: cursor.meta, phase: .stopped, at: Date())
+                    }
                     changed = true
-                    continue
                 }
-                guard let event = parseTurnEvent(line) else { continue }
-                titles = loadTitles()
-                switch event {
-                case .started:
-                    cursor.meta.source = currentSource(for: cursor.meta)
-                    responses.removeValue(forKey: cursor.meta.key)
-                    prompts.removeValue(forKey: cursor.meta.key)
-                    models.removeValue(forKey: cursor.meta.key)
-                    usages.removeValue(forKey: cursor.meta.key)
-                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
-                    agentPrompts.removeValue(forKey: cursor.meta.key)
-                    activities[cursor.meta.key] = activity(for: cursor.meta, phase: .running, at: Date())
-                case .completed:
-                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
-                    agentPrompts.removeValue(forKey: cursor.meta.key)
-                    let completed = activity(for: cursor.meta, phase: .ready, at: Date())
-                    if activities[cursor.meta.key]?.phase == .running, cursor.meta.parentID == nil {
-                        pendingCompletions.insert(completed.key)
-                    }
-                    activities[cursor.meta.key] = completed
-                case .cancelled:
-                    codexOpenPrompts.removeValue(forKey: cursor.meta.key)
-                    agentPrompts.removeValue(forKey: cursor.meta.key)
-                    activities[cursor.meta.key] = activity(for: cursor.meta, phase: .stopped, at: Date())
-                }
-                changed = true
-            }
 
-            cursor.remainder = endsWithNewline ? Data() : Data(parts.last ?? Data.SubSequence())
-            cursors[path] = cursor
-            return changed
+                cursor.remainder = endsWithNewline ? Data() : Data(parts.last ?? Data.SubSequence())
+            }
         } catch {
-            return false
+            // keep whatever was consumed before the read failed.
         }
+        cursors[path] = cursor
+        return changed
     }
 
     private func applyClaudeLine(_ line: Data, for meta: inout SessionMeta, notify: Bool) -> Bool {
@@ -2149,7 +2399,7 @@ private struct OpencodeSessionRow {
 
     switch event {
         case .userPrompt(let prompt):
-            titles = loadTitles()
+            refreshCodexTitles()
             piContextWindows = loadPiContextWindows()
             piOpenAsks.removeValue(forKey: key)
             agentPrompts.removeValue(forKey: key)
@@ -2291,21 +2541,52 @@ private struct OpencodeSessionRow {
     }
 
     private func replayCodexPrompts(at path: String, for meta: SessionMeta) {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
         let key = meta.key
         codexOpenPrompts.removeValue(forKey: key)
-        for line in data.split(separator: 0x0A) {
-            let item = Data(line)
+        // A turn boundary resolves protocol items that did not emit a result,
+        // so only the lines after the newest boundary can still be open.
+        for item in codexLinesAfterLastTurnBoundary(at: path) {
             if let pending = parseCodexPendingPrompt(item) {
                 codexOpenPrompts[key, default: [:]][pending.callID] = pending
             } else if let resolved = parseCodexResolvedCallID(item) {
                 codexOpenPrompts[key]?.removeValue(forKey: resolved)
-            } else if parseTurnEvent(item) != nil {
-                // A turn boundary resolves protocol items that did not emit a result.
-                codexOpenPrompts.removeValue(forKey: key)
             }
         }
         agentPrompts[key] = codexOpenPrompts[key]?.values.sorted { $0.callID < $1.callID }.first
+    }
+
+    // scans backward so long-lived rollouts (gigabytes) are never read whole.
+    private func codexLinesAfterLastTurnBoundary(at path: String) -> [Data] {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)),
+              let size = try? handle.seekToEnd() else { return [] }
+        defer { try? handle.close() }
+
+        let cap: UInt64 = 32 * 1024 * 1024
+        let floor = size > cap ? size - cap : 0
+        let chunkSize: UInt64 = 64 * 1024
+        var position = size
+        var carry = Data()
+        var lines: [Data] = []
+        while position > floor {
+            let count = min(chunkSize, position - floor)
+            position -= count
+            guard (try? handle.seek(toOffset: position)) != nil,
+                  var buffer = try? handle.read(upToCount: Int(count)) else { break }
+            buffer.append(carry)
+            let parts = buffer.split(separator: 0x0A, omittingEmptySubsequences: false)
+            let firstComplete = position == 0 ? 0 : min(1, parts.count)
+            for part in parts.dropFirst(firstComplete).reversed() where !part.isEmpty {
+                let line = Data(part)
+                if parseTurnEvent(line) != nil,
+                   parseCodexPendingPrompt(line) == nil,
+                   parseCodexResolvedCallID(line) == nil {
+                    return lines.reversed()
+                }
+                lines.append(line)
+            }
+            carry = parts.first.map { Data($0) } ?? Data()
+        }
+        return lines.reversed()
     }
 
     private func latestCodexSnapshot(at path: String) -> SessionSnapshot? {
@@ -2314,6 +2595,9 @@ private struct OpencodeSessionRow {
         defer { try? handle.close() }
 
         let chunkSize: UInt64 = 64 * 1024
+        // a turn longer than this is still summarized from its newest events.
+        let cap: UInt64 = 64 * 1024 * 1024
+        let floor = size > cap ? size - cap : 0
         var position = size
         var carry = Data()
         var latestEvent: TurnEvent?
@@ -2322,8 +2606,8 @@ private struct OpencodeSessionRow {
         var model: String?
         var usage: UsageSnapshot?
 
-        while position > 0 {
-            let count = min(chunkSize, position)
+        while position > floor {
+            let count = min(chunkSize, position - floor)
             position -= count
 
             do {
@@ -2508,15 +2792,21 @@ private struct OpencodeSessionRow {
 
     private func loadTitles() -> [String: String] {
         let index = codexHome.appendingPathComponent("session_index.jsonl")
+        let indexStamp = FileStamp(index)
         var result: [String: String] = [:]
-        if let data = try? Data(contentsOf: index) {
-            for line in data.split(separator: 0x0A) {
-                guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                      let id = object["id"] as? String,
-                      let title = object["thread_name"] as? String,
-                      let name = condensedText(title) else { continue }
-                result[id] = name
+        if let cache = indexTitlesCache, cache.stamp == indexStamp {
+            result = cache.titles
+        } else {
+            if let data = try? Data(contentsOf: index) {
+                for line in data.split(separator: 0x0A) {
+                    guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                          let id = object["id"] as? String,
+                          let title = object["thread_name"] as? String,
+                          let name = condensedText(title) else { continue }
+                    result[id] = name
+                }
             }
+            indexTitlesCache = (indexStamp, result)
         }
         guard let databaseURL = codexStateDatabaseURL else { return result }
         return withReadOnlyDatabase(databaseURL) { database in
@@ -2738,6 +3028,7 @@ private struct OpencodeSessionRow {
             self.onChange?(snapshot, usage, claudeUsage)
         }
         for activity in completed { dispatchCompletion(activity) }
+        updateReconciliationCadence()
     }
 
     // Completion callbacks use the same lifecycle boundary as state updates.
@@ -3979,6 +4270,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
 }
 
 private func runSelfTest() {
+    let heldFile = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-held-\(UUID().uuidString).jsonl")
+    try! Data("{}\n".utf8).write(to: heldFile)
+    let heldHandle = try! FileHandle(forReadingFrom: heldFile)
+    assert(filesHeldOpen([heldFile.path]) == [heldFile.path], "An open rollout must count as held")
+    try! heldHandle.close()
+    assert(filesHeldOpen([heldFile.path]).isEmpty, "A closed rollout must not count as held")
+    try? FileManager.default.removeItem(at: heldFile)
+
     assert(notificationWarning(authorization: .denied, alerts: .disabled, style: .none) == "Notifications off")
     assert(notificationWarning(authorization: .notDetermined, alerts: .disabled, style: .none) == "Notifications off")
     assert(notificationWarning(authorization: .authorized, alerts: .disabled, style: .banner) == "Banners off")
@@ -4510,8 +4809,13 @@ private func runSelfTest() {
     func opencodeExecute(_ sql: String, at databaseURL: URL = ocDB) {
         var database: OpaquePointer?
         defer { sqlite3_close(database) }
-        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
-              sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            assertionFailure()
+            return
+        }
+        // the monitor reads on every change event; without wal its shared lock can briefly block writers.
+        sqlite3_busy_timeout(database, 2000)
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
             assertionFailure()
             return
         }
@@ -5005,6 +5309,17 @@ private func runClaudeSelfTest() {
     let newFile = project.appendingPathComponent("new-session.jsonl")
     try! record(["type": "user", "message": ["content": "New session"]], sessionID: "new-test").write(to: newFile)
     assert(waitUntil(timeout: 3) { latest.contains { $0.id == "new-test" && $0.phase == .running } })
+    // a session whose metadata is still being written must register once it grows.
+    let partialFile = project.appendingPathComponent("partial-session.jsonl")
+    let partialRecord = record(["type": "user", "message": ["content": "Partial session"]], sessionID: "partial-test")
+    try! partialRecord.prefix(12).write(to: partialFile)
+    _ = waitUntil(timeout: 1) { false }
+    assert(!latest.contains { $0.id == "partial-test" })
+    let partialHandle = try! FileHandle(forWritingTo: partialFile)
+    try! partialHandle.seekToEnd()
+    try! partialHandle.write(contentsOf: partialRecord.dropFirst(12))
+    try! partialHandle.close()
+    assert(waitUntil(timeout: 3) { latest.contains { $0.id == "partial-test" && $0.phase == .running } })
     replay.stop()
 }
 
