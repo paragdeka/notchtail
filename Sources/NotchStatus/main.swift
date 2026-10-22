@@ -3239,6 +3239,18 @@ private func agentUsageSummary(_ activities: [ThreadActivity], agent: AgentKind 
     return parts.joined(separator: " · ")
 }
 
+// draw() runs on every animation frame; creating system fonts there churns
+// CoreText's font cache; crash reports show CoreText aborting in this path after hours of uptime.
+private enum Typeface {
+    static let count = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+    static let title = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+    static let childTitle = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+    static let body = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    static let badge = NSFont.monospacedSystemFont(ofSize: 9, weight: .bold)
+    static let caption = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+    static let footer = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .medium)
+}
+
 private enum Palette {
     static let notchBlack = NSColor.black
     static let pacYellow = NSColor(srgbRed: 1, green: 0.82, blue: 0.18, alpha: 1)
@@ -3275,9 +3287,12 @@ private func notificationWarning(
 private final class IslandView: NSView {
     var onExpansionChange: ((Bool) -> Void)?
     private(set) var expanded = false
-    private var activities: [ThreadActivity] = []
-    private var accountUsage: UsageSnapshot?
-    private var claudeUsage: UsageSnapshot?
+    // rows and footer are read many times per animation frame; derive them once per change.
+    private var activities: [ThreadActivity] = [] { didSet { invalidateLayout() } }
+    private var accountUsage: UsageSnapshot? { didSet { invalidateLayout() } }
+    private var claudeUsage: UsageSnapshot? { didSet { invalidateLayout() } }
+    private var cachedRows: [ActivityRow]?
+    private var cachedFooterLines: [(agent: AgentKind?, text: String)]?
     private var topBandHeight: CGFloat = 32
     private var physicalNotchWidth: CGFloat = 0
     private var tracking: NSTrackingArea?
@@ -3285,12 +3300,18 @@ private final class IslandView: NSView {
     private var collapseWorkItem: DispatchWorkItem?
     private var disclosureButtons: [String: NSButton] = [:]
     private let notificationButton = NSButton()
-    private var notificationWarning: String?
-    private var expandedGroupIDs = Set<String>()
+    private var notificationWarning: String? { didSet { invalidateLayout() } }
+    private var expandedGroupIDs = Set<String>() { didSet { invalidateLayout() } }
     private var mouthOpen = true
     private var pacmanProgress: CGFloat = 0
     private let rowHeight: CGFloat = 58
+    private func invalidateLayout() {
+        cachedRows = nil
+        cachedFooterLines = nil
+    }
+
     private var footerLines: [(agent: AgentKind?, text: String)] {
+        if let cachedFooterLines { return cachedFooterLines }
         var lines: [(agent: AgentKind?, text: String)] = [
             (.codex, remainingUsageSummary(accountUsage, compact: true)),
             (.claude, remainingUsageSummary(claudeUsage, agent: .claude, compact: true)),
@@ -3299,6 +3320,7 @@ private final class IslandView: NSView {
             agentUsageSummary(activities, agent: .opencode2)]
             .filter { !$0.isEmpty }.joined(separator: " · ")
         if !sessions.isEmpty { lines.append((nil, sessions)) }
+        cachedFooterLines = lines
         return lines
     }
     private var notificationWarningHeight: CGFloat { notificationWarning == nil ? 0 : 26 }
@@ -3473,6 +3495,7 @@ private final class IslandView: NSView {
     var expandedContentHeight: CGFloat { CGFloat(max(1, visibleRowCount)) * rowHeight + footerHeight + 10 }
 
     private var visibleRows: [ActivityRow] {
+        if let cachedRows { return cachedRows }
         var rows: [ActivityRow] = []
         for group in groupActivities(activities).prefix(5) where rows.count < 8 {
             rows.append(ActivityRow(
@@ -3488,6 +3511,7 @@ private final class IslandView: NSView {
                 }
             }
         }
+        cachedRows = rows
         return rows
     }
 
@@ -3574,12 +3598,12 @@ private final class IslandView: NSView {
         drawText(
             String(runningCount),
             in: NSRect(x: bodyLeft + 14, y: centerY - 8, width: 28, height: 16),
-            font: .monospacedSystemFont(ofSize: 13, weight: .bold),
+            font: Typeface.count,
             color: runningCount > 0 ? Palette.phosphor : Palette.tertiaryInk
         )
 
         if let warning = notificationWarning {
-            setAccessibilityHelp("\(warning). Expand the island to open notification settings")
+            updateAccessibilityHelp("\(warning). Expand the island to open notification settings")
             return
         }
 
@@ -3597,7 +3621,7 @@ private final class IslandView: NSView {
                 color: Palette.askPink,
                 blink: mouthOpen
             )
-            setAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
+            updateAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
         } else if runningCount > 0 {
             let runningAgents = Set(groups.filter { $0.phase == .running || $0.phase == .delegating }.map(\.root.agent))
             let track = visiblePacmanTrack(
@@ -3630,7 +3654,7 @@ private final class IslandView: NSView {
                 trailX -= 14
             }
             NSGraphicsContext.restoreGraphicsState()
-            setAccessibilityHelp("Agent is working")
+            updateAccessibilityHelp("Agent is working")
         } else if let stopped = groups.first(where: { $0.phase == .stopped }) {
             drawAgentSprite(
                 agent: stopped.root.agent,
@@ -3639,7 +3663,7 @@ private final class IslandView: NSView {
                 color: Palette.stoppedOrange,
                 running: false
             )
-            setAccessibilityHelp("\(stopped.root.title) stopped")
+            updateAccessibilityHelp("\(stopped.root.title) stopped")
         } else if let ready = groups.first(where: { $0.phase == .ready }) {
             drawAgentSprite(
                 agent: ready.root.agent,
@@ -3648,11 +3672,11 @@ private final class IslandView: NSView {
                 color: Palette.readyGreen,
                 running: false
             )
-            setAccessibilityHelp("\(ready.root.title) is complete")
+            updateAccessibilityHelp("\(ready.root.title) is complete")
         } else {
             Palette.ghostPurple.setFill()
             NSBezierPath(ovalIn: NSRect(x: bodyRight - 18, y: centerY - 2, width: 4, height: 4)).fill()
-            setAccessibilityHelp("No active agent turns")
+            updateAccessibilityHelp("No active agent turns")
         }
     }
 
@@ -3665,7 +3689,7 @@ private final class IslandView: NSView {
             drawText(
                 "No active agent turns",
                 in: NSRect(x: bodyLeft + 16, y: footerHeight + 22, width: bodyRight - bodyLeft - 32, height: 14),
-                font: .monospacedSystemFont(ofSize: 11, weight: .regular),
+                font: Typeface.body,
                 color: Palette.mutedInk
             )
             return
@@ -3709,27 +3733,27 @@ private final class IslandView: NSView {
             drawText(
                 title,
                 in: NSRect(x: textX, y: rowTop - 24, width: max(60, titleRight - textX), height: 16),
-                font: .monospacedSystemFont(ofSize: row.depth > 0 ? 10.5 : 12, weight: row.depth > 0 ? .semibold : .bold),
+                font: row.depth > 0 ? Typeface.childTitle : Typeface.title,
                 color: Palette.phosphor
             )
             drawText(
                 status,
                 in: NSRect(x: statusX, y: rowTop - 23, width: statusWidth, height: 14),
-                font: .monospacedSystemFont(ofSize: 9, weight: .bold),
+                font: Typeface.badge,
                 color: color,
                 alignment: .right
             )
             drawText(
                 prompt?.line ?? row.subagentSummary ?? activity.detail,
                 in: NSRect(x: textX, y: rowTop - 40, width: bodyRight - textX - 10, height: 12),
-                font: .monospacedSystemFont(ofSize: 9, weight: .medium),
+                font: Typeface.caption,
                 color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
             )
             drawSourceMarker(agent: activity.agent, source: activity.source, in: NSRect(x: textX, y: rowTop - 53, width: 9, height: 9))
             drawText(
                 metadata,
                 in: NSRect(x: textX + 14, y: rowTop - 56, width: bodyRight - textX - 24, height: 12),
-                font: .monospacedSystemFont(ofSize: 8.5, weight: .medium),
+                font: Typeface.footer,
                 color: Palette.mutedInk
             )
         }
@@ -3740,7 +3764,7 @@ private final class IslandView: NSView {
         NSRect(x: bodyLeft + 12, y: footerHeight + 5, width: bodyRight - bodyLeft - 24, height: 1).fill()
 
         let lines = footerLines
-        let font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .medium)
+        let font = Typeface.footer
         for (index, line) in lines.enumerated() {
             let textWidth = (line.text as NSString).size(withAttributes: [.font: font]).width
             let iconX = max(bodyLeft + 12, (bodyLeft + bodyRight - textWidth - 18) / 2).rounded(.down)
@@ -3986,26 +4010,62 @@ private final class IslandView: NSView {
         color: NSColor,
         alignment: NSTextAlignment = .left
     ) {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = alignment
-        paragraph.lineBreakMode = .byTruncatingTail
         (text as NSString).draw(in: rect, withAttributes: [
             .font: font,
             .foregroundColor: color,
-            .paragraphStyle: paragraph,
+            .paragraphStyle: Self.truncatingParagraphs[alignment] ?? Self.truncatingParagraphs[.left]!,
         ])
     }
 
+    private static let truncatingParagraphs: [NSTextAlignment: NSParagraphStyle] = Dictionary(
+        uniqueKeysWithValues: [NSTextAlignment.left, .center, .right].map { alignment in
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = alignment
+            paragraph.lineBreakMode = .byTruncatingTail
+            return (alignment, paragraph)
+        }
+    )
+
+    // drawCollapsed runs per animation frame; only touch accessibility when the text changes.
+    private func updateAccessibilityHelp(_ help: String) {
+        if accessibilityHelp() != help { setAccessibilityHelp(help) }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        if let window {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowOcclusionChanged(_:)),
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: window
+            )
+        }
+        updateAnimationTimer()
+    }
+
+    @objc private func windowOcclusionChanged(_ notification: Notification) {
+        updateAnimationTimer()
+        if window?.occlusionState.contains(.visible) == true { needsDisplay = true }
+    }
+
     private func updateAnimationTimer() {
-        let shouldAnimate = activities.contains { $0.phase == .running || $0.prompt != nil }
+        // a locked screen, sleeping display or hidden island cannot show the animation.
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        let shouldAnimate = visible && activities.contains { $0.phase == .running || $0.prompt != nil }
         if shouldAnimate, animationTimer == nil {
-            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            // ~6 fps is enough for a 2px sprite; the step keeps a ~3s lap across the notch.
+            let frameInterval: TimeInterval = 0.16
+            let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 mouthOpen.toggle()
-                pacmanProgress += 0.04
+                pacmanProgress += CGFloat(frameInterval / 3)
                 if pacmanProgress >= 1 { pacmanProgress = 0 }
                 needsDisplay = true
             }
+            // lets the system coalesce frame wakeups with other timers.
+            timer.tolerance = 0.04
             RunLoop.main.add(timer, forMode: .common)
             animationTimer = timer
         } else if !shouldAnimate {
