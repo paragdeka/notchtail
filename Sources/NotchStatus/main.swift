@@ -447,8 +447,14 @@ private func parseUsage(_ line: Data) -> UsageSnapshot? {
 // Codex persists protocol response items even when the UI that owns the
 // approval is not running. Keep these waits read-only and correlate results by
 // call id so an old approval cannot remain visible after the tool finishes.
+// every value the parser accepts appears verbatim in the line, so these cheap
+// scans skip the full json parse for the vast majority of rollout lines.
+private let codexPendingNeedles = ["request_user_input", "user_input_request", "require_escalated"].map { Data($0.utf8) }
+private let codexResolvedNeedles = ["function_call_output", "function_call_result", "response_item_output"].map { Data($0.utf8) }
+
 private func parseCodexPendingPrompt(_ line: Data) -> AgentPrompt? {
-    guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+    guard codexPendingNeedles.contains(where: { line.range(of: $0) != nil }),
+          let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
     let outerPayload = object["payload"] as? [String: Any]
     let item = ((outerPayload?["type"] as? String) == "response_item" ? outerPayload?["payload"] as? [String: Any] : outerPayload) ?? object
     let type = item["type"] as? String ?? ""
@@ -475,7 +481,8 @@ private func parseCodexPendingPrompt(_ line: Data) -> AgentPrompt? {
 }
 
 private func parseCodexResolvedCallID(_ line: Data) -> String? {
-    guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+    guard codexResolvedNeedles.contains(where: { line.range(of: $0) != nil }),
+          let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
     let item = (object["payload"] as? [String: Any]) ?? object
     let type = item["type"] as? String ?? ""
     guard type == "function_call_output" || type == "function_call_result" || type == "response_item_output" else { return nil }
