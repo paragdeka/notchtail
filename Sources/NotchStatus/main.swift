@@ -835,7 +835,7 @@ private func parsePiToolResultID(_ line: Data) -> String? {
 private struct OpencodeMessageHeader {
     let role: String
     let completed: Bool
-    let aborted: Bool
+    let stopped: Bool
     let finish: String?
     let modelID: String?
     let variant: String?
@@ -847,7 +847,6 @@ private func parseOpencodeMessageHeader(_ data: Data) -> OpencodeMessageHeader? 
           let role = object["role"] as? String else { return nil }
 
     let time = object["time"] as? [String: Any]
-    let errorName = ((object["error"] as? [String: Any])?["name"] as? String) ?? ""
     let tokens = object["tokens"] as? [String: Any]
     let cache = tokens?["cache"] as? [String: Any]
 
@@ -856,7 +855,7 @@ private func parseOpencodeMessageHeader(_ data: Data) -> OpencodeMessageHeader? 
     return OpencodeMessageHeader(
         role: role,
         completed: completed,
-        aborted: errorName.contains("Abort"),
+        stopped: object["error"] is [String: Any] || object["finish"] as? String == "error",
         finish: object["finish"] as? String,
         modelID: object["modelID"] as? String,
         variant: object["variant"] as? String,
@@ -868,8 +867,9 @@ private func parseOpencodeMessageHeader(_ data: Data) -> OpencodeMessageHeader? 
 private func opencodeTurnEvent(_ header: OpencodeMessageHeader?) -> TurnEvent? {
     guard let header else { return nil }
     if header.role == "user" { return .started }
-    guard header.role == "assistant" else { return nil }
-    if header.aborted { return .cancelled }
+    guard header.role == "assistant" || header.role == "idle" else { return nil }
+    if header.stopped { return .cancelled }
+    if header.role == "idle" { return .completed }
     if !header.completed { return .started }
     // a reply that ended in tool calls only finished one segment; the turn keeps running
     if header.finish == "tool-calls" || header.finish == "tool_calls" { return .started }
@@ -1044,7 +1044,6 @@ private struct OpencodeV2Message {
 private func parseOpencodeV2Message(id: String, role: String, data: Data) -> OpencodeV2Message? {
     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let time = object["time"] as? [String: Any]
-    let errorName = ((object["error"] as? [String: Any])?["name"] as? String) ?? ""
     let tokens = object["tokens"] as? [String: Any]
     let cache = tokens?["cache"] as? [String: Any]
     let model = object["model"] as? [String: Any]
@@ -1054,7 +1053,8 @@ private func parseOpencodeV2Message(id: String, role: String, data: Data) -> Ope
     let header = OpencodeMessageHeader(
         role: role,
         completed: completed,
-        aborted: errorName.contains("Abort"),
+        stopped: object["error"] is [String: Any] || object["finish"] as? String == "error"
+            || ["failed", "interrupted"].contains(object["outcome"] as? String ?? ""),
         finish: object["finish"] as? String,
         modelID: model?["id"] as? String,
         variant: model?["variant"] as? String,
@@ -1880,7 +1880,8 @@ private struct OpencodeSessionRow {
         _ database: OpaquePointer,
         sessionID: String
     ) -> [(id: String, header: OpencodeMessageHeader, text: String?)] {
-        let sql = "SELECT id, type, data FROM session_message WHERE session_id = ?1 AND type IN ('user','assistant') ORDER BY seq DESC LIMIT 8"
+        // v2 writes terminal outcomes as idle records, including failures before an assistant reply.
+        let sql = "SELECT id, type, data FROM session_message WHERE session_id = ?1 AND type IN ('user','assistant','idle') ORDER BY seq DESC LIMIT 8"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -5079,7 +5080,7 @@ private func runSelfTest() {
     assert(ocUserHeader?.role == "user")
     assert(ocStreamingHeader?.completed == false)
     assert(ocDoneHeader?.contextTokens == 460)
-    assert(ocAbortHeader?.aborted == true)
+    assert(ocAbortHeader?.stopped == true)
     assert(ocNullCompletionHeader?.completed == false)
     assert(opencodeTurnEvent(ocUserHeader) == .started)
     assert(opencodeTurnEvent(ocStreamingHeader) == .started)
@@ -5096,6 +5097,18 @@ private func runSelfTest() {
     assert(ocV2Message?.text == "v2 reply")
     assert(ocV2UserMessage?.text == "v2 prompt")
     assert(opencodeTurnEvent(ocV2UserMessage?.header) == .started)
+    let ocProviderFailure = Data(#"{"role":"assistant","time":{"created":1,"completed":2},"finish":"error","error":{"type":"provider.free-limit","message":"Free usage limit reached.","status":429}}"#.utf8)
+    assert(opencodeTurnEvent(parseOpencodeMessageHeader(ocProviderFailure)) == .cancelled)
+    assert(opencodeTurnEvent(parseOpencodeV2Message(id: "v2error", role: "assistant", data: ocProviderFailure)?.header) == .cancelled)
+    for (json, expected) in [
+        (#"{"time":{"created":2},"outcome":"failed","error":{"type":"provider.free-limit","status":429}}"#, TurnEvent.cancelled),
+        (#"{"time":{"created":2},"outcome":"failed"}"#, .cancelled),
+        (#"{"time":{"created":2},"outcome":"interrupted"}"#, .cancelled),
+        (#"{"time":{"created":2},"outcome":"succeeded"}"#, .completed)
+    ] {
+        let message = parseOpencodeV2Message(id: "v2idle", role: "idle", data: Data(json.utf8))
+        assert(opencodeTurnEvent(message?.header) == expected, "v2 idle outcomes must end the turn")
+    }
     assert(opencodeModelLabel(modelID: "glm-5.3", variant: "high") == "glm-5.3/high")
     assert(opencodeModelLabel(modelID: "glm-5.3", variant: nil) == "glm-5.3")
     assert(opencodeSessionModel(#"{"id":"glm-5.3","providerID":"zai-coding-plan","variant":"high"}"#) == "glm-5.3/high")
@@ -5591,6 +5604,24 @@ private func runSelfTest() {
     UPDATE session_message SET data = '{"model":{"id":"glm-5.3"},"content":[{"type":"text","text":"finished"}],"time":{"created":\(nowMs + 10100),"completed":\(nowMs + 10200)},"finish":"stop"}', time_updated = \(nowMs + 10200) WHERE id = 'v2m11';
     """)
     assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .ready })
+
+    // A provider limit can end a v2 turn before an assistant message is written.
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2limit-user', 'ses_v2-1', 'user', 12, \(nowMs + 10300), \(nowMs + 10300), '{"text":"continue","time":{"created":\(nowMs + 10300)}}');
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .running })
+    let completionsBeforeLimit = completions.count
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2limit-idle', 'ses_v2-1', 'idle', 13, \(nowMs + 10400), \(nowMs + 10400), '{"time":{"created":\(nowMs + 10400)},"outcome":"failed","error":{"type":"provider.free-limit","message":"Free usage limit reached.","status":429}}');
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .stopped },
+           "A v2 provider free-limit idle event must stop the thread")
+    assert(completions.count == completionsBeforeLimit, "Provider failures must not notify successful completion")
+    opencodeExecute("""
+    INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2limit-resume', 'ses_v2-1', 'user', 14, \(nowMs + 10500), \(nowMs + 10500), '{"text":"try another model","time":{"created":\(nowMs + 10500)}}');
+    """)
+    assert(waitUntil(timeout: 3) { latest.first { $0.id == "ses_v2-1" }?.phase == .running },
+           "A new user message must start a turn after a failed idle outcome")
 
     // the same session id in both schema generations stays distinct
     opencodeExecute("""
