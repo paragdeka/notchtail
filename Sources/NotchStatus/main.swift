@@ -213,6 +213,16 @@ private func mergedRateLimits(_ current: RemoteRateLimits?, with refreshed: Remo
     return RemoteRateLimits(primary: primary, secondary: secondary)
 }
 
+// a window past its reset has started over, so stale limits must not keep showing the old usage.
+private func clearingElapsedWindows(_ limits: RemoteRateLimits?, now: Date = Date()) -> RemoteRateLimits? {
+    guard let limits else { return nil }
+    func clear(_ limit: RateLimitUsage?) -> RateLimitUsage? {
+        guard let limit, let reset = limit.resetsAt, reset <= now else { return limit }
+        return RateLimitUsage(usedPercent: 0, windowMinutes: limit.windowMinutes, resetsAt: nil)
+    }
+    return RemoteRateLimits(primary: clear(limits.primary), secondary: clear(limits.secondary))
+}
+
 private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?, unavailableReason: String? = nil) -> UsageSnapshot? {
     guard local != nil || remote != nil || unavailableReason != nil else { return nil }
     guard let local else {
@@ -3041,7 +3051,8 @@ private struct OpencodeSessionRow {
             return $0.updatedAt > $1.updatedAt
         }
         let usage = effectiveUsage(local: nativeUsage, remote: remoteRateLimits)
-        let claudeUsage = effectiveUsage(local: nil, remote: claudeRateLimits, unavailableReason: claudeUsageUnavailableReason)
+        let claudeUsage = effectiveUsage(
+            local: nil, remote: clearingElapsedWindows(claudeRateLimits), unavailableReason: claudeUsageUnavailableReason)
         let callbackGeneration = generation
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isCurrentLifecycle(callbackGeneration) else { return }
@@ -4924,6 +4935,13 @@ private func runSelfTest() {
     assert(limitStatusSymbol(lockedClaudeUsage) == "🔒", "Unavailable Claude usage must identify the Keychain blocker")
     assert(remainingUsageSummary(lockedClaudeUsage, agent: .claude).contains("Keychain approval needed"))
     assert(effectiveUsage(local: nil, remote: nil, unavailableReason: "Keychain approval needed") == lockedClaudeUsage)
+    let elapsedReset = Date(timeIntervalSince1970: 1_000)
+    let elapsedLimits = clearingElapsedWindows(RemoteRateLimits(
+        primary: RateLimitUsage(usedPercent: 75, windowMinutes: 300, resetsAt: elapsedReset),
+        secondary: RateLimitUsage(usedPercent: 80, windowMinutes: 10_080, resetsAt: elapsedReset.addingTimeInterval(60))),
+        now: elapsedReset.addingTimeInterval(1))
+    assert(elapsedLimits?.primary == RateLimitUsage(usedPercent: 0, windowMinutes: 300, resetsAt: nil))
+    assert(elapsedLimits?.secondary?.usedPercent == 80, "Windows before their reset must keep their usage")
     assert(claudeUsageFailure(statusCode: 200, limits: claudeLimits) == nil)
     assert(claudeUsageFailure(statusCode: 200, limits: nil)?.contains("no usable limits") == true)
     assert(claudeUsageFailure(statusCode: 401, limits: nil)?.contains("sign in again") == true)
