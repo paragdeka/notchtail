@@ -2,7 +2,6 @@ import AppKit
 import CoreServices
 import Darwin
 import Foundation
-import Security
 import ServiceManagement
 import SQLite3
 import UserNotifications
@@ -296,7 +295,28 @@ private func parseClaudeAccessToken(_ data: Data) -> String? {
     return token
 }
 
-private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> (token: String?, unavailableReason: String?) {
+// claude code writes this item through /usr/bin/security, which recreates its ACL on every
+// token refresh; reading through the same tool stays trusted, while a direct
+// SecItemCopyMatching loses its "Always Allow" approval each time.
+private func readClaudeKeychainCredentials() -> (data: Data?, exitStatus: Int32) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in finished.signal() }
+    do { try process.run() } catch { return (nil, -1) }
+    if finished.wait(timeout: .now() + 10) == .timedOut {
+        process.terminate()
+        return (nil, -1)
+    }
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    return (process.terminationStatus == 0 ? data : nil, process.terminationStatus)
+}
+
+private func loadClaudeAccessToken(home: URL) -> (token: String?, unavailableReason: String?) {
     let missingLogin = "Claude login unavailable. Open Claude Code and sign in."
     if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !token.isEmpty { return (token, nil) }
     let file = home.appendingPathComponent(".credentials.json")
@@ -306,24 +326,11 @@ private func loadClaudeAccessToken(home: URL, allowInteraction: Bool) -> (token:
     }
     let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
     guard home.resolvingSymlinksInPath().path == defaultHome.resolvingSymlinksInPath().path else { return (nil, missingLogin) }
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "Claude Code-credentials",
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    // Legacy generic-password ACLs can ignore LAContext's no-interaction policy.
-    var interactionAllowed = DarwinBoolean(true)
-    SecKeychainGetUserInteractionAllowed(&interactionAllowed)
-    if !allowInteraction { SecKeychainSetUserInteractionAllowed(false) }
-    defer {
-        if !allowInteraction { SecKeychainSetUserInteractionAllowed(interactionAllowed.boolValue) }
-    }
-    var value: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &value)
-    guard status == errSecSuccess, let data = value as? Data else {
-        if status == errSecItemNotFound { return (nil, missingLogin) }
-        return (nil, "Keychain access required (\(status)). Restart notchtail and choose Always Allow for Claude Code-credentials.")
+    let result = readClaudeKeychainCredentials()
+    // security exits 44 when the item does not exist.
+    if result.exitStatus == 44 { return (nil, missingLogin) }
+    guard let data = result.data else {
+        return (nil, "Keychain read failed (\(result.exitStatus)). Retrying automatically.")
     }
     let token = parseClaudeAccessToken(data)
     return (token, token == nil ? missingLogin : nil)
@@ -1201,7 +1208,6 @@ private final class SessionMonitor {
     private var claudeUsageFetchInFlight = false
     private var claudeUsageNextFetchAt = Date.distantPast
     private var claudeUsageTask: URLSessionDataTask?
-    private var claudeKeychainAccessRequested = false
     private let claudeUsageSession = URLSession(configuration: .ephemeral)
     private var expiryWorkItem: DispatchWorkItem?
     private var reconciliationTimer: DispatchSourceTimer?
@@ -2946,15 +2952,10 @@ private struct OpencodeSessionRow {
         claudeUsageFetchInFlight = true
         claudeUsageNextFetchAt = Date().addingTimeInterval(60)
         let callbackGeneration = generation
-        let allowInteraction = !claudeKeychainAccessRequested
-        claudeKeychainAccessRequested = true
-        if allowInteraction {
-            claudeUsageUnavailableReason = "Keychain access pending. Choose Always Allow for Claude Code-credentials in the macOS prompt."
-        }
         let home = claudeHome
-        // A Keychain approval must not block the session watcher or app shutdown.
+        // A Keychain read must not block the session watcher or app shutdown.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let credential = loadClaudeAccessToken(home: home, allowInteraction: allowInteraction)
+            let credential = loadClaudeAccessToken(home: home)
             self?.queue.async { [weak self] in
                 guard let self, self.active, self.generation == callbackGeneration else { return }
                 let previousReason = self.claudeUsageUnavailableReason
