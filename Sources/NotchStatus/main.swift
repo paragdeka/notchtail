@@ -3511,8 +3511,18 @@ private final class IslandView: NSView {
     private let notificationButton = NSButton()
     private var notificationWarning: String? { didSet { invalidateLayout() } }
     private var expandedGroupIDs = Set<String>() { didSet { invalidateLayout() } }
-    private var mouthOpen = true
-    private var pacmanProgress: CGFloat = 0
+    private var animationStart: CFTimeInterval = 0
+    // the pet train lives in core animation layers, so the render server moves it without waking the app per frame.
+    private let trainLayer = CALayer()
+    private let trainFadeMask = CAGradientLayer()
+    private var trainRunners: [AgentKind: CALayer] = [:]
+    // each pet keeps a place in line; place n runs the same lap as place 0, n spacings behind it.
+    private var trainSlots: [AgentKind: Int] = [:]
+    private var trainJoins: [AgentKind: (slot: Int, work: DispatchWorkItem)] = [:]
+    private var trainBuiltWidth: CGFloat = 0
+    private var trainEpoch: CFTimeInterval = 0
+    private var trainLapDuration: CFTimeInterval = 0
+    private var spriteImages: [String: CGImage] = [:]
     private let rowHeight: CGFloat = 58
     private let childRowHeight: CGFloat = 40
     private var maxRowsHeight: CGFloat { 8 * rowHeight }
@@ -3604,6 +3614,7 @@ private final class IslandView: NSView {
         }
         syncDisclosureButtons()
         layoutNotificationButton()
+        updateAnimationTimer()
         needsDisplay = true
         onExpansionChange?(value)
     }
@@ -3896,6 +3907,7 @@ private final class IslandView: NSView {
             drawCollapsed()
             context.restoreGState()
         }
+        syncPetTrain()
         if progress > 0 {
             context.saveGState()
             context.setAlpha(progress)
@@ -3936,8 +3948,9 @@ private final class IslandView: NSView {
         let runningCount = groups.filter { $0.phase == .running || $0.phase == .delegating }.count
 
         if let prompting = activities.first(where: { $0.prompt != nil }) {
-            drawAgentSprite(agent: prompting.agent, at: leftEar, pixel: 2, color: Palette.askPink, running: false)
-            drawQuestionMark(at: rightEar, pixel: 2, color: Palette.askPink, blink: mouthOpen)
+            drawAgentSprite(agent: prompting.agent, at: leftEar, pixel: 2, color: Palette.askPink)
+            let pulse = 0.5 + 0.5 * cos(2 * .pi * animationClock / 1.4)
+            drawQuestionMark(at: rightEar, pixel: 2, color: Palette.askPink, opacity: 0.4 + 0.6 * pulse)
             updateAccessibilityHelp("\(prompting.agent.displayName) is asking: \(prompting.prompt?.line ?? "")")
             return
         }
@@ -3950,45 +3963,15 @@ private final class IslandView: NSView {
                 color: Palette.phosphor,
                 alignment: .center
             )
-            let runningAgents = Set(groups.filter { $0.phase == .running || $0.phase == .delegating }.map(\.root.agent))
-            let track = visiblePacmanTrack(
-                in: bounds,
-                bodyInset: bodyInset,
-                physicalNotchWidth: physicalNotchWidth
-            )
-            let pacmanX = track.lowerBound + (track.upperBound - track.lowerBound) * pacmanProgress
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: NSRect(
-                x: bounds.minX,
-                y: bounds.minY,
-                width: bodyRight - 10 - bounds.minX,
-                height: bounds.height
-            )).addClip()
-            drawDots(after: pacmanX, from: track.lowerBound + 9, through: track.upperBound, y: centerY)
-            let agentOrder: [AgentKind] = [.codex, .pi, .claude, .opencode, .opencode2]
-            let lead = agentOrder.first { runningAgents.contains($0) } ?? .codex
-            drawAgentSprite(agent: lead, at: NSPoint(x: pacmanX, y: centerY), pixel: 2, color: Palette.pacYellow, running: true)
-            var trailX = pacmanX - 16
-            for agent in agentOrder
-            where agent != lead && runningAgents.contains(agent) {
-                drawAgentSprite(
-                    agent: agent,
-                    at: NSPoint(x: max(track.lowerBound, trailX), y: centerY),
-                    pixel: 2,
-                    color: Palette.pacYellow,
-                    running: true
-                )
-                trailX -= 14
-            }
-            NSGraphicsContext.restoreGraphicsState()
+            // the pets themselves are core animation layers; see syncPetTrain.
             updateAccessibilityHelp("Agent is working")
         } else if let stopped = groups.first(where: { $0.phase == .stopped }) {
-            drawAgentSprite(agent: stopped.root.agent, at: leftEar, pixel: 2, color: Palette.stoppedOrange, running: false)
-            drawPixelSprite(Self.crossGlyph, at: rightEar, pixel: 2, color: Palette.stoppedOrange, bob: false)
+            drawAgentSprite(agent: stopped.root.agent, at: leftEar, pixel: 2, color: Palette.stoppedOrange)
+            drawPixelSprite(Self.crossGlyph, at: rightEar, pixel: 2, color: Palette.stoppedOrange)
             updateAccessibilityHelp("\(stopped.root.title) stopped")
         } else if let ready = groups.first(where: { $0.phase == .ready }) {
-            drawAgentSprite(agent: ready.root.agent, at: leftEar, pixel: 2, color: Palette.readyGreen, running: false)
-            drawPixelSprite(Self.checkGlyph, at: rightEar, pixel: 2, color: Palette.readyGreen, bob: false)
+            drawAgentSprite(agent: ready.root.agent, at: leftEar, pixel: 2, color: Palette.readyGreen)
+            drawPixelSprite(Self.checkGlyph, at: rightEar, pixel: 2, color: Palette.readyGreen)
             updateAccessibilityHelp("\(ready.root.title) is complete")
         } else if let warning = notificationWarning {
             // the bell button sits in the left ear.
@@ -4074,7 +4057,7 @@ private final class IslandView: NSView {
             at: NSPoint(x: bodyLeft + 16, y: centerY),
             pixel: 2,
             color: status.color,
-            running: row.phase == .running
+            lift: row.phase == .running && rowGaitUp ? 2 : 0
         )
         drawText(
             activity.title,
@@ -4111,7 +4094,7 @@ private final class IslandView: NSView {
             at: NSPoint(x: bodyLeft + 34, y: lineY),
             pixel: 1.5,
             color: status.color,
-            running: row.phase == .running
+            lift: row.phase == .running && rowGaitUp ? 1.5 : 0
         )
 
         // plain status text keeps the parent's filled pill the strongest mark in the group.
@@ -4231,7 +4214,7 @@ private final class IslandView: NSView {
         for (index, line) in layout.limitLines.enumerated() {
             let y = footerHeight - notificationWarningHeight - CGFloat(index + 1) * 15
             drawAgentSprite(agent: line.agent, at: NSPoint(x: tableX + 5.25, y: y + 6.75), pixel: 1.5,
-                color: line.agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk, running: false)
+                color: line.agent == .claude ? Palette.claudeCoral : Palette.tertiaryInk)
             var x = tableX + iconWidth
             for (index, column) in layout.columns.enumerated() {
                 if let run = layout.run(for: line, column: index) { drawFooterRun(run, x: x, y: y) }
@@ -4279,7 +4262,8 @@ private final class IslandView: NSView {
         min(1, max(0, (bounds.height - topBandHeight) / expandedContentHeight))
     }
 
-    private var bodyInset: CGFloat { 12 + 18 * expansionProgress }
+    private let collapsedBodyInset: CGFloat = 12
+    private var bodyInset: CGFloat { collapsedBodyInset + 18 * expansionProgress }
 
     private func islandPath() -> NSBezierPath {
         let neckHeight = 8 + 2 * expansionProgress
@@ -4323,17 +4307,6 @@ private final class IslandView: NSView {
         return path
     }
 
-    private func drawDots(after pacmanX: CGFloat, from startX: CGFloat, through endX: CGFloat, y: CGFloat) {
-        Palette.tertiaryInk.setFill()
-        var x = startX
-        while x <= endX {
-            if x > pacmanX + 7 {
-                NSRect(x: x - 1, y: y - 1, width: 2, height: 2).fill()
-            }
-            x += 9
-        }
-    }
-
     private func drawCodexLogo(at center: NSPoint, pixel: CGFloat, color: NSColor) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState()
@@ -4355,7 +4328,7 @@ private final class IslandView: NSView {
         context.strokePath()
     }
 
-    private func drawPiSymbol(at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
+    private func drawPiSymbol(at center: NSPoint, pixel: CGFloat, color: NSColor) {
         let rows: [UInt8] = [
             0b1111111,
             0b0100010,
@@ -4365,11 +4338,11 @@ private final class IslandView: NSView {
             0b0100010,
             0b0100010,
         ]
-        drawPixelSprite(rows, at: center, pixel: pixel, color: color, bob: bob)
+        drawPixelSprite(rows, at: center, pixel: pixel, color: color)
     }
 
     // opencode's pixelated logo: a square frame with a filled block riding low in the cavity.
-    private func drawOpencodeLogo(at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
+    private func drawOpencodeLogo(at center: NSPoint, pixel: CGFloat, color: NSColor) {
         let frame: [UInt8] = [
             0b0111110,
             0b0100010,
@@ -4388,11 +4361,11 @@ private final class IslandView: NSView {
             0b0011100,
             0b0000000,
         ]
-        drawPixelSprite(frame, at: center, pixel: pixel, color: color, bob: bob)
-        drawPixelSprite(block, at: center, pixel: pixel, color: color.withAlphaComponent(0.55), bob: bob)
+        drawPixelSprite(frame, at: center, pixel: pixel, color: color)
+        drawPixelSprite(block, at: center, pixel: pixel, color: color.withAlphaComponent(color.alphaComponent * 0.55))
     }
 
-    private func drawQuestionMark(at center: NSPoint, pixel: CGFloat, color: NSColor, blink: Bool) {
+    private func drawQuestionMark(at center: NSPoint, pixel: CGFloat, color: NSColor, opacity: CGFloat) {
         let rows: [UInt8] = [
             0b0011100,
             0b0100010,
@@ -4406,15 +4379,14 @@ private final class IslandView: NSView {
             rows,
             at: center,
             pixel: pixel,
-            color: blink ? color : color.withAlphaComponent(0.45),
-            bob: false
+            color: color.withAlphaComponent(opacity)
         )
     }
 
-    private func drawPixelSprite<Row: BinaryInteger>(_ rows: [Row], width: Int = 7, at center: NSPoint, pixel: CGFloat, color: NSColor, bob: Bool) {
+    private func drawPixelSprite<Row: BinaryInteger>(_ rows: [Row], width: Int = 7, at center: NSPoint, pixel: CGFloat, color: NSColor) {
         let origin = NSPoint(
             x: center.x - pixel * CGFloat(width) / 2,
-            y: center.y - pixel * CGFloat(rows.count) / 2 + (bob ? pixel : 0)
+            y: center.y - pixel * CGFloat(rows.count) / 2
         )
         color.setFill()
         let path = NSBezierPath()
@@ -4431,14 +4403,15 @@ private final class IslandView: NSView {
         path.fill()
     }
 
-    private func drawAgentSprite(agent: AgentKind, at center: NSPoint, pixel: CGFloat, color: NSColor, running: Bool) {
+    private func drawAgentSprite(agent: AgentKind, at point: NSPoint, pixel: CGFloat, color: NSColor, lift: CGFloat = 0) {
+        let center = NSPoint(x: point.x, y: point.y + lift)
         switch agent {
         case .codex:
             drawCodexLogo(at: center, pixel: pixel, color: color)
         case .pi:
-            drawPiSymbol(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
+            drawPiSymbol(at: center, pixel: pixel, color: color)
         case .opencode, .opencode2:
-            drawOpencodeLogo(at: center, pixel: pixel, color: color, bob: running && mouthOpen)
+            drawOpencodeLogo(at: center, pixel: pixel, color: color)
         case .claude:
             let rows: [UInt16] = [
                 0b001111111100,
@@ -4450,7 +4423,7 @@ private final class IslandView: NSView {
                 0b001010010100,
                 0b001010010100,
             ]
-            drawPixelSprite(rows, width: 12, at: center, pixel: pixel * 7 / 12, color: color, bob: running && mouthOpen)
+            drawPixelSprite(rows, width: 12, at: center, pixel: pixel * 7 / 12, color: color)
         }
     }
 
@@ -4538,33 +4511,299 @@ private final class IslandView: NSView {
 
     @objc private func windowOcclusionChanged(_ notification: Notification) {
         updateAnimationTimer()
+        syncPetTrain()
         if window?.occlusionState.contains(.visible) == true { needsDisplay = true }
     }
 
     private func updateAnimationTimer() {
         // a locked screen, sleeping display or hidden island cannot show the animation.
         let visible = window?.occlusionState.contains(.visible) ?? false
-        let shouldAnimate = visible && activities.contains { $0.phase == .running || $0.prompt != nil }
-        if shouldAnimate, animationTimer == nil {
-            // ~6 fps is enough for a 2px sprite; the step keeps a ~3s lap across the notch.
-            let frameInterval: TimeInterval = 0.16
-            let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                mouthOpen.toggle()
-                pacmanProgress += CGFloat(frameInterval / 3)
-                if pacmanProgress >= 1 { pacmanProgress = 0 }
-                needsDisplay = true
-            }
-            // lets the system coalesce frame wakeups with other timers.
-            timer.tolerance = 0.04
-            RunLoop.main.add(timer, forMode: .common)
-            animationTimer = timer
-        } else if !shouldAnimate {
+        let asking = activities.contains { $0.prompt != nil }
+        // the collapsed pet train runs on core animation, so the timer only serves the expanded rows'
+        // bob and the question-mark pulse.
+        let shouldAnimate = visible && (asking || (expanded && activities.contains { $0.phase == .running }))
+        guard shouldAnimate else {
             animationTimer?.invalidate()
             animationTimer = nil
-            mouthOpen = true
-            pacmanProgress = 0
+            return
         }
+        guard animationTimer == nil else { return }
+        animationStart = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if expanded { needsDisplay = true } else { setNeedsDisplay(rightEarRect) }
+        }
+        // lets the system coalesce frame wakeups with other timers; effects read the clock, so drift never shows.
+        timer.tolerance = 0.03
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    private var rightEarRect: NSRect {
+        let center = NSPoint(x: bounds.maxX - bodyInset - collapsedEarInset, y: bounds.maxY - topBandHeight / 2)
+        return NSRect(x: center.x - 12, y: center.y - 12, width: 24, height: 24)
+    }
+
+    private var animationClock: CFTimeInterval {
+        animationTimer == nil ? 0 : CACurrentMediaTime() - animationStart
+    }
+
+    // expanded rows keep the old two-step bob, now on the clock instead of the frame count.
+    private var rowGaitUp: Bool {
+        animationTimer != nil && animationClock.truncatingRemainder(dividingBy: 0.5) < 0.25
+    }
+
+    // each agent moves its own way: codex is a wheel and rolls, pi strides tall, claude takes quick small steps.
+    private struct Gait {
+        let stride: CGFloat
+        let hop: CGFloat
+        var rolls = false
+    }
+
+    private func gait(for agent: AgentKind) -> Gait {
+        switch agent {
+        case .codex: return Gait(stride: 9, hop: 0, rolls: true)
+        case .pi: return Gait(stride: 11, hop: 2)
+        case .claude: return Gait(stride: 6, hop: 1)
+        case .opencode, .opencode2: return Gait(stride: 9, hop: 1.5)
+        }
+    }
+
+    // calm enough to sit in peripheral vision.
+    private let trainSpeed: CGFloat = 12
+    private let trainSpacing: CGFloat = 15
+    private let trainEdgeFade: CGFloat = 8
+    private let trainSpriteHalfWidth: CGFloat = 7
+    private let trainRestTime: CFTimeInterval = 0.3
+    private let trainLeaveDuration: CFTimeInterval = 0.6
+    private let trainLeaveHop: CGFloat = 5
+    private let trainBigHopScale: CGFloat = 2.5
+    private let trainBigHopEvery = 11
+    private let codexWheelRadius: CGFloat = 5.25
+    private let petSpriteSize: CGFloat = 16
+
+    private var desiredTrainAgents: [AgentKind] {
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        guard visible, expansionProgress < 1, !activities.contains(where: { $0.prompt != nil }) else { return [] }
+        let running = Set(groupActivities(activities).filter { $0.phase == .running || $0.phase == .delegating }.map(\.root.agent))
+        let agentOrder: [AgentKind] = [.codex, .pi, .claude, .opencode, .opencode2]
+        return agentOrder.filter { running.contains($0) }
+    }
+
+    // called on every state change and redraw; it only touches layers when something actually changed.
+    private func syncPetTrain() {
+        let desired = desiredTrainAgents
+        guard !desired.isEmpty else {
+            tearDownPetTrain()
+            return
+        }
+        layoutTrainLayer()
+        for agent in trainSlots.keys where !desired.contains(agent) { petLeaves(agent) }
+        for (agent, join) in trainJoins where !desired.contains(agent) {
+            join.work.cancel()
+            trainJoins[agent] = nil
+        }
+        let resized = expansionProgress == 0 && abs(trainLayer.bounds.width - trainBuiltWidth) > 1
+        if trainSlots.isEmpty || resized {
+            buildPetTrain(desired)
+            return
+        }
+        for agent in desired where trainSlots[agent] == nil && trainJoins[agent] == nil { scheduleJoin(agent) }
+    }
+
+    // a newcomer takes the first free place in line and slips in the next time that place is
+    // hidden behind the notch, so nobody pops into view mid-track.
+    private func scheduleJoin(_ agent: AgentKind) {
+        let taken = Set(trainSlots.values).union(trainJoins.values.map(\.slot))
+        let slot = (0...).first { !taken.contains($0) }!
+        let slotStart = trainEpoch + CFTimeInterval(slot) * trainSlotDelay
+        let now = CACurrentMediaTime()
+        let joinTime = slotStart + max(0, ((now - slotStart) / trainLapDuration).rounded(.up)) * trainLapDuration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            trainJoins[agent] = nil
+            guard desiredTrainAgents.contains(agent), trainSlots[agent] == nil else { return }
+            addRunner(agent, slot: slot, lapStart: joinTime)
+        }
+        trainJoins[agent] = (slot, work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, joinTime - now), execute: work)
+    }
+
+    private var trainSlotDelay: CFTimeInterval { CFTimeInterval(trainSpacing / trainSpeed) }
+
+    private func layoutTrainLayer() {
+        guard let layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if trainLayer.superlayer == nil {
+            trainLayer.masksToBounds = true
+            trainFadeMask.startPoint = CGPoint(x: 0, y: 0.5)
+            trainFadeMask.endPoint = CGPoint(x: 1, y: 0.5)
+            trainFadeMask.colors = [NSColor.clear.cgColor, NSColor.black.cgColor, NSColor.black.cgColor]
+            trainLayer.mask = trainFadeMask
+            layer.addSublayer(trainLayer)
+        }
+        // laid out for the collapsed island, so a lap built mid-collapse still runs to the real edge.
+        let track = visiblePacmanTrack(in: bounds, bodyInset: collapsedBodyInset, physicalNotchWidth: physicalNotchWidth)
+        let minX = track.lowerBound - trainSpriteHalfWidth
+        // the right edge sits just inside the island's own edge, so pets slide out under it without
+        // poking past the rounded corner.
+        let maxX = bounds.maxX - collapsedBodyInset - 1
+        trainLayer.frame = NSRect(x: minX, y: bounds.maxY - topBandHeight, width: max(1, maxX - minX), height: topBandHeight)
+        trainFadeMask.frame = trainLayer.bounds
+        let fadeEnd = NSNumber(value: Double(min(1, (trainSpriteHalfWidth + trainEdgeFade) / trainLayer.bounds.width)))
+        trainFadeMask.locations = [NSNumber(value: Double(fadeEnd.doubleValue * 0.5)), fadeEnd, 1]
+        trainLayer.opacity = Float(1 - expansionProgress)
+        CATransaction.commit()
+    }
+
+    private func tearDownPetTrain() {
+        trainJoins.values.forEach { $0.work.cancel() }
+        trainJoins = [:]
+        guard !trainSlots.isEmpty || trainLayer.sublayers?.isEmpty == false else { return }
+        trainLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        trainRunners = [:]
+        trainSlots = [:]
+    }
+
+    private func buildPetTrain(_ agents: [AgentKind]) {
+        trainJoins.values.forEach { $0.work.cancel() }
+        trainJoins = [:]
+        trainRunners.values.forEach { $0.removeFromSuperlayer() }
+        trainRunners = [:]
+        trainSlots = [:]
+        trainBuiltWidth = trainLayer.bounds.width
+        // a pet loops on its own: it re-emerges at the notch edge right after sliding past the island's
+        // right edge, instead of waiting for the rest of the line to finish.
+        trainLapDuration = CFTimeInterval(trainBuiltWidth / trainSpeed) + trainRestTime
+        trainEpoch = CACurrentMediaTime()
+        for (slot, agent) in agents.enumerated() {
+            addRunner(agent, slot: slot, lapStart: trainEpoch + CFTimeInterval(slot) * trainSlotDelay)
+        }
+    }
+
+    private func addRunner(_ agent: AgentKind, slot: Int, lapStart: CFTimeInterval) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // the entry point tucks the sprite just under the notch; the lap ends once it is fully past the right edge.
+        let entryX = trainSpriteHalfWidth
+        let travel = trainBuiltWidth
+        let travelTime = CFTimeInterval(travel / trainSpeed)
+        let runner = CALayer()
+        runner.bounds = CGRect(x: 0, y: 0, width: petSpriteSize, height: petSpriteSize)
+        runner.position = CGPoint(x: entryX, y: trainLayer.bounds.height / 2)
+        let body = CALayer()
+        body.frame = runner.bounds
+        body.contents = spriteImage(agent, finished: false)
+        body.contentsScale = window?.backingScaleFactor ?? 2
+        body.magnificationFilter = .nearest
+        body.minificationFilter = .nearest
+        runner.addSublayer(body)
+
+        let lap = CAKeyframeAnimation(keyPath: "position.x")
+        lap.values = [entryX, entryX + travel, entryX + travel]
+        lap.keyTimes = [0, NSNumber(value: travelTime / trainLapDuration), 1]
+        lap.duration = trainLapDuration
+        lap.repeatCount = .infinity
+        lap.beginTime = lapStart
+        lap.fillMode = .backwards
+        runner.add(lap, forKey: "lap")
+        body.add(gaitAnimation(for: agent, place: slot), forKey: "gait")
+        trainLayer.addSublayer(runner)
+        trainRunners[agent] = runner
+        trainSlots[agent] = slot
+        CATransaction.commit()
+    }
+
+    private func gaitAnimation(for agent: AgentKind, place: Int) -> CAAnimation {
+        let gait = gait(for: agent)
+        let hopDuration = CFTimeInterval(gait.stride / trainSpeed)
+        if gait.rolls {
+            let roll = CABasicAnimation(keyPath: "transform.rotation.z")
+            roll.fromValue = 0
+            roll.toValue = -2 * CGFloat.pi
+            roll.duration = CFTimeInterval(2 * .pi * codexWheelRadius / trainSpeed)
+            roll.repeatCount = .infinity
+            return roll
+        }
+        // every pet gets one exuberant hop per cycle, staggered by place so they never all leap together;
+        // neighbours hop half a stride apart so the line reads as a trot instead of one rigid block.
+        let hops = trainBigHopEvery
+        let baseY = petSpriteSize / 2
+        var values: [CGFloat] = []
+        var keyTimes: [NSNumber] = []
+        var timing: [CAMediaTimingFunction] = []
+        for hop in 0..<hops {
+            let height = gait.hop * (hop == hops / 2 ? trainBigHopScale : 1)
+            values += [baseY, baseY + height]
+            keyTimes += [NSNumber(value: Double(hop) / Double(hops)), NSNumber(value: (Double(hop) + 0.5) / Double(hops))]
+            timing += [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
+        }
+        values.append(baseY)
+        keyTimes.append(1)
+        let bounce = CAKeyframeAnimation(keyPath: "position.y")
+        bounce.values = values
+        bounce.keyTimes = keyTimes
+        bounce.timingFunctions = timing
+        bounce.duration = hopDuration * CFTimeInterval(hops)
+        bounce.repeatCount = .infinity
+        bounce.timeOffset = hopDuration * (CFTimeInterval(place * 4 % hops) + (place % 2 == 1 ? 0.5 : 0))
+        return bounce
+    }
+
+    // a finished agent turns ready-green, hops out of the line where it stands and fades away.
+    private func petLeaves(_ agent: AgentKind) {
+        trainSlots[agent] = nil
+        guard let runner = trainRunners.removeValue(forKey: agent) else { return }
+        let x = runner.presentation()?.position.x ?? runner.position.x
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { runner.removeFromSuperlayer() }
+        runner.removeAllAnimations()
+        runner.position.x = x
+        runner.opacity = 0
+        if let body = runner.sublayers?.first {
+            body.removeAllAnimations()
+            body.contents = spriteImage(agent, finished: true)
+        }
+        let hop = CAKeyframeAnimation(keyPath: "position.y")
+        hop.values = [runner.position.y, runner.position.y + trainLeaveHop, runner.position.y]
+        hop.keyTimes = [0, 0.45, 1]
+        hop.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [1, 1, 0]
+        fade.keyTimes = [0, 0.4, 1]
+        let leave = CAAnimationGroup()
+        leave.animations = [hop, fade]
+        leave.duration = trainLeaveDuration
+        runner.add(leave, forKey: "leave")
+        CATransaction.commit()
+    }
+
+    // sprites are rendered once per agent and colour, then reused by every lap.
+    private func spriteImage(_ agent: AgentKind, finished: Bool) -> CGImage? {
+        let scale = window?.backingScaleFactor ?? 2
+        let key = "\(agent.label):\(finished):\(scale)"
+        if let image = spriteImages[key] { return image }
+        let pixels = Int(petSpriteSize * scale)
+        guard let context = CGContext(
+            data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        drawAgentSprite(
+            agent: agent,
+            at: NSPoint(x: petSpriteSize / 2, y: petSpriteSize / 2),
+            pixel: 2,
+            color: finished ? Palette.readyGreen : Palette.pacYellow
+        )
+        NSGraphicsContext.restoreGraphicsState()
+        let image = context.makeImage()
+        spriteImages[key] = image
+        return image
     }
 
     private func updateAccessibilityValue() {
