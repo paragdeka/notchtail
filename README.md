@@ -29,7 +29,17 @@ Hover or click the island to see session details and expand subagent groups.
   <img src="docs/images/expanded.webp" alt="Close-up of the expanded island: a Codex thread with three subagents on a tree, one asking for approval, a Claude thread with two subagents, and the shared limits footer" width="460">
 </p>
 
-## Build and run
+## Install
+
+Download `notchtail-<version>.dmg` from the [latest release](https://github.com/paragdeka/codex-notch-status/releases/latest), open it, and drag **notchtail** to **Applications**.
+
+The app isn't notarized by Apple, so macOS blocks the first launch. Open it once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Or run:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/notchtail.app
+```
+
+## Build from source
 
 **Requires macOS 13+ and Xcode Command Line Tools.**
 
@@ -55,7 +65,7 @@ Answer questions and approve commands in the agent's own app or terminal.
 - **Read-only monitoring.** Session status comes from local files and databases. Requests that an agent doesn't save locally may not appear.
 - **Claude coverage.** Supports CLI and local Desktop Code sessions. Chat, Cowork, and remote-only Desktop sessions are excluded.
 - **Account access.** Limits use authenticated requests to OpenAI and Anthropic with your existing logins. Credentials are never logged or changed.
-- **Keychain access.** If macOS asks, choose **Always Allow** to let Claude limits refresh in the background. Rebuilding the app may trigger another prompt.
+- **Keychain access.** If macOS asks, choose **Always Allow** to let Claude limits refresh in the background. The approval applies to macOS's `security` tool, so it survives app updates.
 
 <details>
 <summary>Session folders and timeouts</summary>
