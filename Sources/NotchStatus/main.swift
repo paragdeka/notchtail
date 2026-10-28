@@ -592,6 +592,8 @@ private struct ClaudeSessionState {
     var updatedAt: Date?
     var pending: [String: AgentPrompt] = [:]
     var subagentNames: [String: String] = [:]
+    // set when Claude moves the conversation into a new session file; the new session shows it instead.
+    var continuedIn: String?
     private var customName: String?
     private var generatedName: String?
     private var handbacks: [String: String] = [:]
@@ -655,7 +657,10 @@ private struct ClaudeSessionState {
                 let taskNotification = text?.hasPrefix("<task-notification>") == true
                     || (object["origin"] as? [String: Any])?["kind"] as? String == "task-notification"
                     || object["turnOrigin"] as? String == "task_notification"
-                if !taskNotification, let text { prompt = text }
+                if !taskNotification, let text {
+                    prompt = text
+                    continuedIn = nil
+                }
                 response = nil
                 pending.removeAll()
                 handbacks.removeAll()
@@ -709,6 +714,12 @@ private struct ClaudeSessionState {
             pending.removeAll()
         case "progress":
             guard event == .started else { return false }
+        case "continued-in":
+            guard let id = object["continuedInSessionId"] as? String else { return false }
+            continuedIn = id
+            pending.removeAll()
+            handbacks.removeAll()
+            turnActivity = false
         case "custom-title":
             guard let value = object["customTitle"] as? String else { return false }
             customName = condensedText(value)
@@ -2388,6 +2399,18 @@ private struct OpencodeSessionRow {
         guard claudeSessions[key, default: ClaudeSessionState()].consume(line),
               let state = claudeSessions[key] else { return false }
         if let source = state.source { meta.source = source }
+        let parentContinued = meta.parentID.map { claudeSessions["claude:\($0)"]?.continuedIn != nil } ?? false
+        if state.continuedIn != nil || parentContinued {
+            let hidden = Set([key] + cursors.values
+                .filter { $0.meta.agent == .claude && $0.meta.parentID == meta.id }.map(\.meta.key))
+            let removed = activities.keys.filter(hidden.contains)
+            for hiddenKey in hidden {
+                activities.removeValue(forKey: hiddenKey)
+                agentPrompts.removeValue(forKey: hiddenKey)
+                pendingCompletions.remove(hiddenKey)
+            }
+            return !removed.isEmpty
+        }
         guard let event = state.event, let date = state.updatedAt else { return false }
         prompts[key] = state.prompt
         responses[key] = state.response
@@ -5986,6 +6009,14 @@ private func runClaudeSelfTest() {
     notificationState.consume(record(["type": "user", "origin": ["kind": "task-notification"],
         "message": ["content": "Background task finished"]]))
     assert(notificationState.prompt == "hello from Claude")
+
+    var continuedState = ClaudeSessionState()
+    continuedState.consume(user)
+    continuedState.consume(taskNotification)
+    assert(continuedState.consume(record(["type": "continued-in", "continuedInSessionId": "next-session"]))
+        && continuedState.continuedIn == "next-session", "A session continued elsewhere must be marked for hiding")
+    continuedState.consume(user)
+    assert(continuedState.continuedIn == nil, "A new prompt in the old session must show it again")
 
     var state = ClaudeSessionState()
     assert(!state.consume(Data("broken json".utf8)))
