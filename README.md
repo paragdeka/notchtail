@@ -23,7 +23,7 @@
 Collapsed, the island shows how many sessions are running, and a pet for each busy agent trots out from under the notch. When an agent finishes, its pet turns green and hops away.
 
 <p align="center">
-  <img src="docs/images/pets.webp" alt="Animation of the collapsed island counting three running sessions while Codex, Pi, and Claude pets trot out from under the notch. Pi and Claude finish and hop away in green, then Codex finishes and the island shows a green check." width="880">
+  <img src="docs/images/pets.webp" alt="Animation of the collapsed island counting three running sessions while Codex, Claude, and opencode pets trot out from under the notch. Claude and opencode finish and hop away in green, then Codex finishes and the island shows a green check." width="880">
 </p>
 
 <p align="center">
