@@ -650,8 +650,12 @@ private struct ClaudeSessionState {
             } else if !results.isEmpty {
                 if event != .cancelled { event = .started }
             } else {
+                // transcript-only records (e.g. orphaned task notifications on resume) never reach the model,
+                // and typed slash commands like /compact may finish without any assistant reply.
                 guard object["isMeta"] as? Bool != true,
                       object["isCompactSummary"] as? Bool != true,
+                      object["queueTranscriptOnly"] as? Bool != true,
+                      text.map(isClaudeSlashCommand) != true,
                       text?.hasPrefix("<local-command-") != true,
                       text?.hasPrefix("<command-name>") != true else { return false }
                 let taskNotification = text?.hasPrefix("<task-notification>") == true
@@ -745,6 +749,13 @@ private let claudeTimestamp: ISO8601DateFormatter = {
     return formatter
 }()
 private let claudeTimestampWithoutFraction = ISO8601DateFormatter()
+
+// matches "/compact" or "/plugin:skill args" but not a pasted path like "/Users/me/file".
+private func isClaudeSlashCommand(_ text: String) -> Bool {
+    guard text.hasPrefix("/") else { return false }
+    let command = text.dropFirst().prefix { !$0.isWhitespace }
+    return !command.isEmpty && command.allSatisfy { $0.isLetter || $0.isNumber || "-_:".contains($0) }
+}
 
 private func claudeSource(_ entrypoint: String) -> String {
     if entrypoint.contains("desktop") { return "desktop" }
@@ -6009,6 +6020,18 @@ private func runClaudeSelfTest() {
     notificationState.consume(record(["type": "user", "origin": ["kind": "task-notification"],
         "message": ["content": "Background task finished"]]))
     assert(notificationState.prompt == "hello from Claude")
+
+    var idleState = ClaudeSessionState()
+    idleState.consume(user)
+    idleState.consume(done)
+    assert(!idleState.consume(record(["type": "user", "origin": ["kind": "task-notification"], "queueTranscriptOnly": true,
+        "message": ["content": "<task-notification><status>stopped</status></task-notification>"]])),
+        "Transcript-only notifications never reach the model and must not start a turn")
+    assert(!idleState.consume(record(["type": "user", "message": ["content": "/compact"]])),
+        "Typed slash commands may finish without a reply and must not start a turn")
+    assert(idleState.event == .completed)
+    assert(idleState.consume(record(["type": "user", "message": ["content": "/Users/me/file.swift is broken"]]))
+        && idleState.event == .started, "A prompt starting with a path is a real prompt")
 
     var continuedState = ClaudeSessionState()
     continuedState.consume(user)
