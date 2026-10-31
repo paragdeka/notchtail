@@ -750,6 +750,20 @@ private let claudeTimestamp: ISO8601DateFormatter = {
 }()
 private let claudeTimestampWithoutFraction = ISO8601DateFormatter()
 
+private let claudeHandledRecordTypes: Set<String> = [
+    "user", "assistant", "system", "progress", "continued-in", "custom-title", "ai-title",
+]
+private let claudeTypePrefix = Data(#"{"type":""#.utf8)
+
+// bookkeeping records (api request blobs, file snapshots) are a large share of claude logs and lead
+// with their type, so they can be skipped without decoding the json.
+private func isIgnoredClaudeRecord(_ line: Data) -> Bool {
+    guard line.starts(with: claudeTypePrefix) else { return false }
+    let start = line.startIndex + claudeTypePrefix.count
+    guard let end = line[start..<min(line.endIndex, start + 64)].firstIndex(of: 0x22) else { return false }
+    return !claudeHandledRecordTypes.contains(String(decoding: line[start..<end], as: UTF8.self))
+}
+
 // matches "/compact" or "/plugin:skill args" but not a pasted path like "/Users/me/file".
 private func isClaudeSlashCommand(_ text: String) -> Bool {
     guard text.hasPrefix("/") else { return false }
@@ -2313,7 +2327,9 @@ private struct OpencodeSessionRow {
                 for part in parts.prefix(completeCount) {
                     let line = Data(part)
                     if cursor.meta.agent == .claude {
-                        changed = applyClaudeLine(line, for: &cursor.meta, notify: notify) || changed
+                        guard !isIgnoredClaudeRecord(line) else { continue }
+                        // drain foundation objects per line; a first replay can decode hundreds of megabytes.
+                        changed = autoreleasepool { applyClaudeLine(line, for: &cursor.meta, notify: notify) } || changed
                         continue
                     }
                     if cursor.meta.agent == .pi {
@@ -6020,6 +6036,10 @@ private func runClaudeSelfTest() {
     notificationState.consume(record(["type": "user", "origin": ["kind": "task-notification"],
         "message": ["content": "Background task finished"]]))
     assert(notificationState.prompt == "hello from Claude")
+
+    assert(isIgnoredClaudeRecord(Data(#"{"type":"api-request-blob","blob":"x"}"#.utf8)))
+    assert(!isIgnoredClaudeRecord(Data(#"{"type":"ai-title","aiTitle":"x"}"#.utf8)))
+    assert(!isIgnoredClaudeRecord(Data(#"{"parentUuid":null,"type":"user"}"#.utf8)))
 
     var idleState = ClaudeSessionState()
     idleState.consume(user)
