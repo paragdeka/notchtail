@@ -4111,7 +4111,7 @@ private final class IslandView: NSView {
         )
         drawText(
             activity.title,
-            in: NSRect(x: textX, y: rowTop - 24, width: max(60, titleRight - textX), height: 16),
+            in: capCenteredRect(x: textX, width: max(60, titleRight - textX), centerY: centerY, font: Typeface.title),
             font: Typeface.title,
             color: Palette.phosphor
         )
@@ -4121,10 +4121,16 @@ private final class IslandView: NSView {
             font: Typeface.caption,
             color: prompt != nil ? Palette.askPink : Palette.tertiaryInk
         )
-        drawSourceMarker(agent: activity.agent, source: activity.source, in: NSRect(x: textX, y: rowTop - 53, width: 8, height: 8))
+        let metadataCenterY = rowTop - 51
+        let markerCenterY = metadataCenterY - 0.5
+        drawSourceMarker(
+            agent: activity.agent,
+            source: activity.source,
+            in: NSRect(x: textX, y: (markerCenterY - 4).rounded(), width: 8, height: 8)
+        )
         drawText(
             metadata,
-            in: NSRect(x: textX + 13, y: rowTop - 57, width: bodyRight - textX - 23, height: 13),
+            in: capCenteredRect(x: textX + 13, width: bodyRight - textX - 23, centerY: metadataCenterY, font: Typeface.footer),
             font: Typeface.footer,
             color: Palette.mutedInk
         )
