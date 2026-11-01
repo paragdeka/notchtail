@@ -589,6 +589,8 @@ private struct ClaudeSessionState {
     var model: String?
     var name: String? { customName ?? generatedName }
     var source: String?
+    // only the interactive cli is known to register its process in <claude home>/sessions.
+    var interactiveCLI = false
     var updatedAt: Date?
     var pending: [String: AgentPrompt] = [:]
     var subagentNames: [String: String] = [:]
@@ -613,6 +615,7 @@ private struct ClaudeSessionState {
               let type = object["type"] as? String else { return false }
         if let entrypoint = object["entrypoint"] as? String {
             source = claudeSource(entrypoint)
+            interactiveCLI = entrypoint == "cli"
         }
         let message = object["message"] as? [String: Any] ?? [:]
         let content = message["content"]
@@ -1192,6 +1195,23 @@ private func filesHeldOpen(_ candidates: Set<String>) -> Set<String> {
     return held
 }
 
+// interactive claude cli processes record their pid and current session in
+// <claude home>/sessions/<pid>.json; nil means the registry is unavailable.
+private func liveClaudeSessionIDs(in registry: URL) -> Set<String>? {
+    guard let files = try? FileManager.default.contentsOfDirectory(at: registry, includingPropertiesForKeys: nil)
+    else { return nil }
+    var ids = Set<String>()
+    for file in files where file.pathExtension == "json" {
+        guard let data = try? Data(contentsOf: file),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pid = (object["pid"] as? NSNumber)?.int32Value, pid > 0,
+              let sessionID = object["sessionId"] as? String,
+              kill(pid, 0) == 0 || errno == EPERM else { continue }
+        ids.insert(sessionID)
+    }
+    return ids
+}
+
 private final class SessionMonitor {
     private struct Cursor {
         var offset: UInt64
@@ -1265,8 +1285,9 @@ private final class SessionMonitor {
     // files not worth reading again until they grow: metadata not written yet,
     // or idle sessions retired from the cursor set.
     private var skipUntilGrowth: [String: UInt64] = [:]
-    private var abandonedCodexKeys: Set<String> = []
+    private var abandonedKeys: Set<String> = []
     private var lastLivenessCheckAt = Date.distantPast
+    private var lastClaudeLivenessCheckAt = Date.distantPast
     private var opencodeRecheckWorkItem: DispatchWorkItem?
     private var readConnections: [String: (fileNumber: UInt64, database: OpaquePointer)] = [:]
     private var generation: UInt = 0
@@ -1567,6 +1588,7 @@ private final class SessionMonitor {
         changed = reconcileOpencode() || changed
         changed = stopOrphanedTurns() || changed
         changed = stopAbandonedCodexTurns() || changed
+        changed = stopAbandonedClaudeTurns() || changed
         refreshCodexAccountUsageIfNeeded()
         refreshClaudeAccountUsageIfNeeded()
         if changed { publish() }
@@ -1621,7 +1643,36 @@ private final class SessionMonitor {
             activity.phase = .stopped
             activity.updatedAt = now
             activities[cursor.meta.key] = activity
-            abandonedCodexKeys.insert(cursor.meta.key)
+            abandonedKeys.insert(cursor.meta.key)
+            changed = true
+        }
+        return changed
+    }
+
+    // a claude cli that exits mid-turn (killed, crashed, or replaced by an orca handoff)
+    // never writes the turn's end, which otherwise keeps it running until the silence timeout.
+    private func stopAbandonedClaudeTurns() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastClaudeLivenessCheckAt) >= 30 else { return false }
+        let silent = cursors.filter { path, cursor in
+            guard cursor.meta.agent == .claude,
+                  claudeSessions[cursor.meta.key]?.interactiveCLI == true,
+                  let activity = activities[cursor.meta.key],
+                  activity.phase == .running, activity.prompt == nil,
+                  let stamp = FileStamp(URL(fileURLWithPath: path)) else { return false }
+            return now.timeIntervalSince(stamp.modified) >= 60
+        }
+        guard !silent.isEmpty else { return false }
+        lastClaudeLivenessCheckAt = now
+        guard let live = liveClaudeSessionIDs(in: claudeHome.appendingPathComponent("sessions", isDirectory: true))
+        else { return false }
+        var changed = false
+        for cursor in silent.values where !live.contains(cursor.meta.parentID ?? cursor.meta.id) {
+            guard var activity = activities[cursor.meta.key] else { continue }
+            activity.phase = .stopped
+            activity.updatedAt = now
+            activities[cursor.meta.key] = activity
+            abandonedKeys.insert(cursor.meta.key)
             changed = true
         }
         return changed
@@ -2309,7 +2360,7 @@ private struct OpencodeSessionRow {
         defer { try? handle.close() }
         var changed = false
         // a write proves the liveness check wrong; resume the turn until its own end event.
-        if abandonedCodexKeys.remove(cursor.meta.key) != nil, activities[cursor.meta.key]?.phase == .stopped {
+        if abandonedKeys.remove(cursor.meta.key) != nil, activities[cursor.meta.key]?.phase == .stopped {
             activities[cursor.meta.key] = activity(for: cursor.meta, phase: .running, at: Date())
             changed = true
         }
@@ -6121,6 +6172,21 @@ private func runClaudeSelfTest() {
         ["type": "tool_use", "id": "bash-progress", "name": "Bash", "input": ["description": "Compare HEAD routes and refresh job"]]]]]))
     assert(state.response == "Bash: Compare HEAD routes and refresh job")
     assert(shouldMarkStopped(.running, updatedAt: Date().addingTimeInterval(-claudeRunningInactivityTimeout - 1), timeout: claudeRunningInactivityTimeout))
+    var cliState = ClaudeSessionState()
+    cliState.consume(record(["type": "user", "message": ["content": "Hi"]]))
+    assert(cliState.interactiveCLI)
+    var sdkState = ClaudeSessionState()
+    sdkState.consume(record(["type": "user", "message": ["content": "Hi"]], entrypoint: "sdk-cli"))
+    assert(!sdkState.interactiveCLI, "Only the interactive cli registers its process")
+
+    let registry = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-registry-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: registry) }
+    assert(liveClaudeSessionIDs(in: registry) == nil)
+    try! FileManager.default.createDirectory(at: registry, withIntermediateDirectories: true)
+    let ownPID = ProcessInfo.processInfo.processIdentifier
+    try! Data(#"{"pid":\#(ownPID),"sessionId":"alive"}"#.utf8).write(to: registry.appendingPathComponent("\(ownPID).json"))
+    try! Data(#"{"pid":99999999,"sessionId":"gone"}"#.utf8).write(to: registry.appendingPathComponent("99999999.json"))
+    assert(liveClaudeSessionIDs(in: registry) == ["alive"], "Dead registry entries must not count as live sessions")
 
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("notch-status-claude-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
