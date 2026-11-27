@@ -69,6 +69,45 @@ private enum AgentKind: Equatable {
     }
 }
 
+// the usage footer rows a user can show or hide; the single source of truth for both the menu and onboarding.
+private enum UsageProvider: CaseIterable {
+    case codex
+    case claude
+
+    static let visibilityDidChange = Notification.Name("notchtail.usageProviderVisibilityDidChange")
+    static let onboardingKey = "didCompleteOnboarding"
+
+    var agent: AgentKind {
+        switch self {
+        case .codex: return .codex
+        case .claude: return .claude
+        }
+    }
+
+    var displayName: String { agent.displayName }
+
+    var defaultsKey: String {
+        switch self {
+        case .codex: return "showCodexUsage"
+        case .claude: return "showClaudeUsage"
+        }
+    }
+
+    var isVisible: Bool {
+        get { UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true }
+        nonmutating set {
+            UserDefaults.standard.set(newValue, forKey: defaultsKey)
+            NotificationCenter.default.post(name: Self.visibilityDidChange, object: nil)
+        }
+    }
+
+    static func registerDefaults() {
+        var defaults: [String: Any] = [onboardingKey: false]
+        for provider in allCases { defaults[provider.defaultsKey] = true }
+        UserDefaults.standard.register(defaults: defaults)
+    }
+}
+
 private let activityRetention: TimeInterval = 15 * 60
 private let runningInactivityTimeout: TimeInterval = 6 * 60 * 60
 private let piRunningInactivityTimeout: TimeInterval = 30 * 60
@@ -193,6 +232,7 @@ private struct UsageSnapshot: Equatable {
     let secondaryLimit: RateLimitUsage?
     let costTotal: Double?
     var unavailableReason: String? = nil
+    var hasActiveSubscription: Bool = true
 
     var refreshWarning: String? {
         guard let unavailableReason else { return nil }
@@ -223,8 +263,13 @@ private func clearingElapsedWindows(_ limits: RemoteRateLimits?, now: Date = Dat
     return RemoteRateLimits(primary: clear(limits.primary), secondary: clear(limits.secondary))
 }
 
-private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?, unavailableReason: String? = nil) -> UsageSnapshot? {
-    guard local != nil || remote != nil || unavailableReason != nil else { return nil }
+private func effectiveUsage(
+    local: UsageSnapshot?,
+    remote: RemoteRateLimits?,
+    unavailableReason: String? = nil,
+    hasActiveSubscription: Bool = true
+) -> UsageSnapshot? {
+    guard local != nil || remote != nil || unavailableReason != nil || !hasActiveSubscription else { return nil }
     guard let local else {
         return UsageSnapshot(
             totalTokens: 0,
@@ -233,7 +278,8 @@ private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?, un
             primaryLimit: remote?.primary,
             secondaryLimit: remote?.secondary,
             costTotal: nil,
-            unavailableReason: unavailableReason
+            unavailableReason: unavailableReason,
+            hasActiveSubscription: hasActiveSubscription
         )
     }
     return UsageSnapshot(
@@ -243,7 +289,8 @@ private func effectiveUsage(local: UsageSnapshot?, remote: RemoteRateLimits?, un
         primaryLimit: remote?.primary ?? local.primaryLimit,
         secondaryLimit: remote?.secondary ?? local.secondaryLimit,
         costTotal: local.costTotal,
-        unavailableReason: unavailableReason ?? local.unavailableReason
+        unavailableReason: unavailableReason ?? local.unavailableReason,
+        hasActiveSubscription: hasActiveSubscription
     )
 }
 
@@ -251,9 +298,18 @@ private struct OpencodeStore {
     let databaseURL: URL
 }
 
-private func parseCodexUsageResponse(_ data: Data) -> (primary: RateLimitUsage?, secondary: RateLimitUsage?)? {
-    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let rateLimit = object["rate_limit"] as? [String: Any] else { return nil }
+// a lapsed ChatGPT subscription reports plan_type "free"; a missing plan_type is unknown, not inactive.
+private func codexSubscriptionActive(planType: Any?) -> Bool? {
+    guard let plan = (planType as? String)?.lowercased() else { return nil }
+    return !plan.hasPrefix("free")
+}
+
+private func parseCodexUsageResponse(_ data: Data) -> (primary: RateLimitUsage?, secondary: RateLimitUsage?, subscriptionActive: Bool?)? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let subscriptionActive = codexSubscriptionActive(planType: object["plan_type"])
+    guard let rateLimit = object["rate_limit"] as? [String: Any] else {
+        return subscriptionActive == nil ? nil : (nil, nil, subscriptionActive)
+    }
     func parse(_ value: Any?) -> RateLimitUsage? {
         guard let window = value as? [String: Any],
               let used = (window["used_percent"] as? NSNumber)?.doubleValue,
@@ -261,7 +317,7 @@ private func parseCodexUsageResponse(_ data: Data) -> (primary: RateLimitUsage?,
         let reset = (window["reset_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
         return RateLimitUsage(usedPercent: used, windowMinutes: Int((seconds / 60).rounded()), resetsAt: reset)
     }
-    return (parse(rateLimit["primary_window"]), parse(rateLimit["secondary_window"]))
+    return (parse(rateLimit["primary_window"]), parse(rateLimit["secondary_window"]), subscriptionActive)
 }
 
 private func parseClaudeUsageResponse(_ data: Data) -> RemoteRateLimits? {
@@ -475,7 +531,8 @@ private func parseUsage(_ line: Data) -> UsageSnapshot? {
         contextWindow: contextWindow,
         primaryLimit: limit(rateLimits?["primary"]),
         secondaryLimit: limit(rateLimits?["secondary"]),
-        costTotal: nil
+        costTotal: nil,
+        hasActiveSubscription: codexSubscriptionActive(planType: rateLimits?["plan_type"]) ?? true
     )
 }
 
@@ -1266,6 +1323,7 @@ private final class SessionMonitor {
     private var nativeUsage: UsageSnapshot?
     private var nativeUsageUpdatedAt = Date.distantPast
     private var remoteRateLimits: RemoteRateLimits?
+    private var codexSubscriptionActive: Bool?
     private var accountUsageFetchInFlight = false
     private var accountUsageFetchAttemptedAt = Date.distantPast
     private var accountUsageTask: URLSessionDataTask?
@@ -3049,7 +3107,12 @@ private struct OpencodeSessionRow {
                 guard self.active, self.generation == callbackGeneration else { return }
                 self.accountUsageFetchInFlight = false
                 self.accountUsageTask = nil
-                guard parsed.primary != nil || parsed.secondary != nil else { return }
+                let subscriptionChanged = parsed.subscriptionActive != nil && parsed.subscriptionActive != self.codexSubscriptionActive
+                if let subscriptionActive = parsed.subscriptionActive { self.codexSubscriptionActive = subscriptionActive }
+                guard parsed.primary != nil || parsed.secondary != nil else {
+                    if subscriptionChanged { self.publish() }
+                    return
+                }
                 self.remoteRateLimits = mergedRateLimits(self.remoteRateLimits, with: RemoteRateLimits(
                     primary: parsed.primary, secondary: parsed.secondary))
                 self.publish()
@@ -3151,7 +3214,8 @@ private struct OpencodeSessionRow {
             }
             return $0.updatedAt > $1.updatedAt
         }
-        let usage = effectiveUsage(local: nativeUsage, remote: remoteRateLimits)
+        let usage = effectiveUsage(
+            local: nativeUsage, remote: remoteRateLimits, hasActiveSubscription: codexSubscriptionActive ?? nativeUsage?.hasActiveSubscription ?? true)
         let claudeUsage = effectiveUsage(
             local: nil, remote: clearingElapsedWindows(claudeRateLimits), unavailableReason: claudeUsageUnavailableReason)
         let callbackGeneration = generation
@@ -3337,6 +3401,8 @@ private func usageSummary(_ usage: UsageSnapshot?) -> String {
     return parts.joined(separator: " · ")
 }
 
+private let noSubscriptionLabel = "no active subscription"
+
 private func usageWindows(_ usage: UsageSnapshot?, agent: AgentKind) -> [(label: String, minutes: Int, limit: RateLimitUsage?)] {
     if agent == .claude { return [("5h", 300, usage?.primaryLimit), ("weekly", 10_080, usage?.secondaryLimit)] }
     return [usage?.primaryLimit, usage?.secondaryLimit].compactMap { $0 }
@@ -3353,6 +3419,7 @@ private func resetLabel(_ limit: RateLimitUsage) -> String? {
 }
 
 private func remainingUsageSummary(_ usage: UsageSnapshot?, agent: AgentKind = .codex) -> String {
+    if let usage, !usage.hasActiveSubscription { return "\(agent.displayName) · \(noSubscriptionLabel)" }
     let windows = usageWindows(usage, agent: agent)
     var parts = [agent.displayName]
     parts += windows.isEmpty ? ["usage unavailable"] : windows.map { label, _, limit in
@@ -3374,7 +3441,8 @@ private struct LimitCell: Equatable {
 }
 
 private func limitCells(_ usage: UsageSnapshot?, agent: AgentKind) -> [LimitCell] {
-    usageWindows(usage, agent: agent).map { label, minutes, limit in
+    if let usage, !usage.hasActiveSubscription { return [] }
+    return usageWindows(usage, agent: agent).map { label, minutes, limit in
         LimitCell(
             label: label == "weekly" ? "7d" : label,
             windowMinutes: minutes,
@@ -3495,6 +3563,8 @@ private struct FooterLayout {
         let cells: [Int: (label: String, run: FooterRun)]
         // shown in the first column when the provider reports no windows at all.
         let placeholder: FooterRun?
+        // a long placeholder runs on across the columns instead of widening the first one for the other provider's row.
+        var placeholderOverflows = false
         let status: FooterRun?
     }
 
@@ -3550,9 +3620,10 @@ private func footerLimitLine(_ usage: UsageSnapshot?, agent: AgentKind) -> Foote
         uniquingKeysWith: { first, _ in first }
     )
     var placeholder: FooterRun?
+    let inactive = usage.map { !$0.hasActiveSubscription } ?? false
     if cells.isEmpty {
         var unavailable = FooterRun()
-        unavailable.append(.text("—", Palette.mutedInk))
+        unavailable.append(.text(inactive ? noSubscriptionLabel : "—", Palette.mutedInk))
         placeholder = unavailable
     }
     let status = limitStatusSymbol(usage).map { symbol -> FooterRun in
@@ -3560,7 +3631,8 @@ private func footerLimitLine(_ usage: UsageSnapshot?, agent: AgentKind) -> Foote
         run.append(.text(symbol, Palette.pacYellow))
         return run
     }
-    return FooterLayout.LimitLine(agent: agent, cells: cells, placeholder: placeholder, status: status)
+    return FooterLayout.LimitLine(
+        agent: agent, cells: cells, placeholder: placeholder, placeholderOverflows: inactive, status: status)
 }
 
 // a dashed track stretches between the label and a right-aligned note, so the cell spans its column
@@ -3585,8 +3657,10 @@ private func footerColumns(for lines: [FooterLayout.LimitLine]) -> [FooterLayout
         let missing = lines.contains { $0.cells[minutes] == nil && $0.placeholder == nil }
         return FooterLayout.Column(minutes: minutes, absent: absent, width: missing ? max(width, absent.width) : width)
     }
-    if let placeholderWidth = lines.compactMap({ $0.placeholder?.width }).max() {
-        if columns.isEmpty { columns = [FooterLayout.Column(minutes: 0, absent: FooterRun(), width: 0)] }
+    if columns.isEmpty {
+        let placeholderWidth = lines.compactMap { $0.placeholder?.width }.max() ?? 0
+        if placeholderWidth > 0 { columns = [FooterLayout.Column(minutes: 0, absent: FooterRun(), width: placeholderWidth)] }
+    } else if let placeholderWidth = lines.compactMap({ $0.placeholderOverflows ? nil : $0.placeholder?.width }).max() {
         columns[0].width = max(columns[0].width, placeholderWidth)
     }
     return columns
@@ -3636,7 +3710,9 @@ private final class IslandView: NSView {
 
     private var footerLayout: FooterLayout {
         if let cachedFooterLayout { return cachedFooterLayout }
-        let limitLines = [footerLimitLine(accountUsage, agent: .codex), footerLimitLine(claudeUsage, agent: .claude)]
+        let limitLines = UsageProvider.allCases.filter(\.isVisible).map { provider in
+            footerLimitLine(provider == .codex ? accountUsage : claudeUsage, agent: provider.agent)
+        }
         let layout = FooterLayout(limitLines: limitLines, columns: footerColumns(for: limitLines))
         cachedFooterLayout = layout
         return layout
@@ -3662,6 +3738,13 @@ private final class IslandView: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func usageVisibilityChanged() {
+        invalidateLayout()
+        layoutNotificationButton()
+        updateAccessibilityValue()
+        needsDisplay = true
+    }
 
     func setNotificationWarning(_ warning: String?) {
         guard notificationWarning != warning else { return }
@@ -3973,9 +4056,25 @@ private final class IslandView: NSView {
         )
         notifications.target = self
         menu.addItem(.separator())
+        for provider in UsageProvider.allCases {
+            let item = menu.addItem(
+                withTitle: "Show \(provider.displayName) Usage",
+                action: #selector(toggleUsageProvider(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = provider
+            item.state = provider.isVisible ? .on : .off
+        }
+        menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "Quit notchtail", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func toggleUsageProvider(_ sender: NSMenuItem) {
+        guard let provider = sender.representedObject as? UsageProvider else { return }
+        provider.isVisible.toggle()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
@@ -4307,10 +4406,11 @@ private final class IslandView: NSView {
     }
 
     private func drawFooter(bodyLeft: CGFloat, bodyRight: CGFloat) {
+        let layout = footerLayout
+        guard !layout.limitLines.isEmpty else { return }
         Palette.hairline.setFill()
         NSRect(x: bodyLeft + 12, y: footerHeight + 5, width: bodyRight - bodyLeft - 24, height: 1).fill()
 
-        let layout = footerLayout
         let iconWidth: CGFloat = 18
         let columnGap: CGFloat = 16
         let columnsWidth = layout.columns.map(\.width).reduce(0, +) + columnGap * CGFloat(max(0, layout.columns.count - 1))
@@ -4931,8 +5031,10 @@ private final class IslandView: NSView {
             "\(asking) asking, \(running) running, \(delegating) delegating, \(ready) ready, \(stopped) stopped, \(seen) seen"
                 + (agentCounts.isEmpty ? "" : ", \(agentCounts)")
                 + groups.filter { !$0.children.isEmpty }.map { ", \($0.root.title): \($0.subagentSummary)" }.joined()
-                + ", \(remainingUsageSummary(accountUsage).replacingOccurrences(of: "↻", with: "resets"))"
-                + ", \(remainingUsageSummary(claudeUsage, agent: .claude).replacingOccurrences(of: "↻", with: "resets"))"
+                + UsageProvider.allCases.filter(\.isVisible).map { provider in
+                    ", " + remainingUsageSummary(provider == .codex ? accountUsage : claudeUsage, agent: provider.agent)
+                        .replacingOccurrences(of: "↻", with: "resets")
+                }.joined()
                 + notificationSummary
         )
     }
@@ -4974,6 +5076,15 @@ private final class IslandController {
             object: nil,
             queue: .main
         ) { [weak self] _ in self?.resize(animated: false) }
+
+        NotificationCenter.default.addObserver(
+            forName: UsageProvider.visibilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.island.usageVisibilityChanged()
+            self?.resize(animated: true)
+        }
 
         resize(animated: false)
         panel.orderFrontRegardless()
@@ -5062,11 +5173,70 @@ private func acknowledgementPlan(for application: NSRunningApplication) -> Ackno
         : AcknowledgementPlan()
 }
 
+private final class OnboardingWindowController: NSObject, NSWindowDelegate {
+    private let window: NSWindow
+    private var checkboxes: [NSButton: UsageProvider] = [:]
+
+    override init() {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 190),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+        window.title = "Welcome to notchtail"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        let copy = NSTextField(wrappingLabelWithString:
+            "Choose which usage limits appear in the notch. You can change this later from the right-click menu.")
+        copy.preferredMaxLayoutWidth = 340
+        let boxes = UsageProvider.allCases.map { provider -> NSButton in
+            let box = NSButton(checkboxWithTitle: "Show \(provider.displayName) usage", target: self, action: #selector(toggled(_:)))
+            box.state = provider.isVisible ? .on : .off
+            checkboxes[box] = provider
+            return box
+        }
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        done.keyEquivalent = "\r"
+        let stack = NSStackView(views: [copy] + boxes + [done])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.setCustomSpacing(18, after: boxes.last ?? copy)
+        window.contentView = stack
+        window.setContentSize(stack.fittingSize)
+        window.center()
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func toggled(_ sender: NSButton) {
+        checkboxes[sender]?.isVisible = sender.state == .on
+    }
+
+    @objc private func finish() {
+        window.close()
+    }
+
+    // closing by any route counts as done, so the window never reappears.
+    func windowWillClose(_ notification: Notification) {
+        UserDefaults.standard.set(true, forKey: UsageProvider.onboardingKey)
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private let monitor = SessionMonitor()
     private var island: IslandController?
+    private var onboarding: OnboardingWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UsageProvider.registerDefaults()
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
         notifications.requestAuthorization(options: [.alert, .sound]) { [weak self] _, error in
@@ -5140,6 +5310,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             }
         }
         monitor.start()
+        if !UserDefaults.standard.bool(forKey: UsageProvider.onboardingKey) {
+            let onboarding = OnboardingWindowController()
+            self.onboarding = onboarding
+            onboarding.show()
+        }
     }
 
     private func refreshNotificationSettings() {
@@ -5218,6 +5393,22 @@ private func runSelfTest() {
     let accountResponse = Data(#"{"rate_limit":{"primary_window":{"used_percent":12.5,"limit_window_seconds":18000,"reset_at":1800000000},"secondary_window":null}}"#.utf8)
     assert(parseCodexUsageResponse(accountResponse)?.primary?.windowMinutes == 300)
     assert(parseCodexUsageResponse(accountResponse)?.secondary == nil)
+    let freeResponse = Data(#"{"plan_type":"free","rate_limit":{"primary_window":null,"secondary_window":{"used_percent":7,"limit_window_seconds":2592000,"reset_at":1800000000}}}"#.utf8)
+    assert(parseCodexUsageResponse(freeResponse)?.subscriptionActive == false, "A free plan_type means the subscription lapsed")
+    assert(parseCodexUsageResponse(freeResponse)?.secondary?.windowMinutes == 43_200)
+    assert(parseCodexUsageResponse(accountResponse)?.subscriptionActive == nil, "A missing plan_type is unknown, not inactive")
+    let freeTokenCount = Data(#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10},"last_token_usage":{"total_tokens":5},"model_context_window":100},"rate_limits":{"primary":{"used_percent":7,"window_minutes":43200},"secondary":null,"plan_type":"free"}}}"#.utf8)
+    assert(parseUsage(freeTokenCount)?.hasActiveSubscription == false, "Session logs carry the lapsed plan before any account fetch")
+    assert(codexSubscriptionActive(planType: "plus") == true && codexSubscriptionActive(planType: "free_trial") == false)
+    let inactiveCodex = effectiveUsage(
+        local: nil,
+        remote: RemoteRateLimits(primary: nil, secondary: parseCodexUsageResponse(freeResponse)?.secondary),
+        hasActiveSubscription: false
+    )
+    let inactiveLine = footerLimitLine(inactiveCodex, agent: .codex)
+    assert(inactiveLine.cells.isEmpty && inactiveLine.placeholder?.text == noSubscriptionLabel)
+    assert(remainingUsageSummary(inactiveCodex) == "Codex · no active subscription")
+    assert(effectiveUsage(local: nil, remote: nil, hasActiveSubscription: false)?.hasActiveSubscription == false)
     let claudeResponse = Data(#"{"five_hour":{"utilization":12.5,"resets_at":"2026-10-20T18:00:00.123Z"},"seven_day":{"utilization":43.25,"resets_at":"2026-10-26T18:00:00Z"}}"#.utf8)
     let claudeLimits = parseClaudeUsageResponse(claudeResponse)
     var retainedClaudeLimits = mergedRateLimits(nil, with: claudeLimits)
@@ -5318,6 +5509,12 @@ private func runSelfTest() {
     let unloadedFooter = FooterLayout(limitLines: unloadedLines, columns: footerColumns(for: unloadedLines))
     assert(unloadedFooter.run(for: unloadedLines[0], column: 0)?.text == "—")
     assert(unloadedFooter.run(for: unloadedLines[0], column: 1) == nil)
+    let inactiveLines = [inactiveLine, footerLimitLine(claudeAccountUsage, agent: .claude)]
+    let inactiveFooter = FooterLayout(limitLines: inactiveLines, columns: footerColumns(for: inactiveLines))
+    assert(inactiveFooter.columns.map(\.minutes) == [300, 10_080], "An inactive Codex row must not add or widen columns")
+    assert(inactiveFooter.run(for: inactiveLines[0], column: 0)?.text == noSubscriptionLabel)
+    let inactiveOnly = [inactiveLine]
+    assert(footerColumns(for: inactiveOnly).first?.width == inactiveLine.placeholder?.width)
     assert(parseClaudeUsageResponse(Data(#"{"error":"unauthorized"}"#.utf8)) == nil)
     assert(parseClaudeUsageResponse(Data("broken json".utf8)) == nil)
     let invalidWindows = parseClaudeUsageResponse(Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"35"}}"#.utf8))
